@@ -34,10 +34,14 @@ export default function App() {
 
       // Espansione link corto, se necessario
       if (isShortGmaps(urlToUse)) {
-        try {
-          const exp = await expandShortMaps(urlToUse);
-          if (exp) urlToUse = exp;
-        } catch {}
+        const exp = await expandShortMaps(urlToUse);
+        if (exp) {
+          urlToUse = exp;
+        } else {
+          setError("Questo è un link corto di Google Maps che non posso espandere automaticamente. Apri il link, tocca \"Apri in Google Maps\" e copia l'URL completo delle Indicazioni.");
+          setLoading(false);
+          return;
+        }
       }
       setResolvedUrl(urlToUse);
 
@@ -173,6 +177,9 @@ export default function App() {
         </div>
 
         {result && <ResultView data={result} />}
+
+        {/* Pannello test (dev) */}
+        <DevTests />
       </div>
     </div>
   );
@@ -204,15 +211,44 @@ function TestsPanel({ onPick }) {
 
 // ——— Parser & URL helpers ———
 function isShortGmaps(urlStr) {
-  try { return new URL(urlStr).hostname === "maps.app.goo.gl"; } catch { return false; }
+  try {
+    const u = new URL(urlStr);
+    // Short link mobile
+    if (u.hostname === "maps.app.goo.gl") return true;
+    // Forma vecchia: goo.gl/maps/...
+    if (u.hostname === "goo.gl" && u.pathname.startsWith("/maps")) return true;
+    return false;
+  } catch {
+    return false;
+  }
 }
 
+
 async function expandShortMaps(shortUrl) {
-  const resp = await fetch(shortUrl, { redirect: "follow" });
-  if (resp?.url && !isShortGmaps(resp.url)) return resp.url;
-  const location = resp.headers?.get?.("Location");
-  if (location && !isShortGmaps(location)) return location;
-  throw new Error("Impossibile espandere automaticamente il link corto (CORS)");
+  try {
+    // 0) Tentativo via proxy serverless
+    const PROXY_PATH = "/api/expand-maps"; // Netlify: "/.netlify/functions/expand-maps"
+    try {
+      const proxyResp = await fetch(`${PROXY_PATH}?u=${encodeURIComponent(shortUrl)}`);
+      if (proxyResp.ok) {
+        const data = await proxyResp.json();
+        if (data?.ok && data?.url && !isShortGmaps(data.url)) return data.url;
+      }
+    } catch {}
+
+    // 1) Parse locale dell’URL (per eventuale ?link=<encoded>)
+    const u = new URL(shortUrl);
+    const embedded = u.searchParams.get("link");
+    if (embedded) return decodeURIComponent(embedded);
+
+    // 2) Fallback: prova a seguire i redirect (spesso bloccato da CORS)
+    const resp = await fetch(shortUrl, { redirect: "follow" });
+    if (resp?.url && !isShortGmaps(resp.url)) return resp.url;
+    const location = resp.headers?.get?.("Location");
+    if (location && !isShortGmaps(location)) return location;
+  } catch {}
+  // Se non si riesce, lascia che il chiamante gestisca la UX
+  return null;
 }
 
 function normalizeRaw(s) { return String(s).replace(/\+/g, " ").replace(/\s+/g, " ").trim(); }
@@ -405,3 +441,46 @@ function TimelineCard({ wp, idx, total }) {
 
 function weatherCodeToText(code) { const map = { 0: "Sereno", 1: "Prevalentemente sereno", 2: "Parzialmente nuvoloso", 3: "Coperto", 45: "Nebbia", 48: "Nebbia con brina", 51: "Pioviggine leggera", 53: "Pioviggine", 55: "Pioviggine intensa", 56: "Pioggia gelata leggera", 57: "Pioggia gelata", 61: "Pioggia debole", 63: "Pioggia", 65: "Pioggia forte", 66: "Rovescio gelato leggero", 67: "Rovescio gelato", 71: "Neve debole", 73: "Neve", 75: "Neve forte", 77: "Granelli di neve", 80: "Rovesci leggeri", 81: "Rovesci", 82: "Rovesci intensi", 85: "Rovesci di neve leggeri", 86: "Rovesci di neve intensi", 95: "Temporale", 96: "Temporale con grandine", 99: "Temporale con grandine forte" }; return map?.[code] ?? `Codice meteo ${code}`; }
 
+// ——— Dev tests (semplici, senza rete) ———
+function DevTests() {
+  const tests = useMemo(() => {
+    const cases = [];
+    // isShortGmaps
+    cases.push({ name: 'isShortGmaps maps.app.goo.gl', pass: isShortGmaps('https://maps.app.goo.gl/abc') === true });
+    cases.push({ name: 'isShortGmaps goo.gl/maps', pass: isShortGmaps('https://goo.gl/maps/abcd') === true });
+    cases.push({ name: 'isShortGmaps google.com/maps (no short)', pass: isShortGmaps('https://www.google.com/maps/dir/?api=1&origin=Milano&destination=Torino') === false });
+
+    // parseGoogleMapsDirections api=1
+    try {
+      const p = parseGoogleMapsDirections('https://www.google.com/maps/dir/?api=1&origin=Milano&destination=Torino&travelmode=driving');
+      cases.push({ name: 'parse api=1 two places', pass: Array.isArray(p.places) && p.places.length >= 2 });
+    } catch (e) {
+      cases.push({ name: 'parse api=1 two places', pass: false, info: String(e?.message || e) });
+    }
+
+    // parse /maps/dir/
+    try {
+      const p2 = parseGoogleMapsDirections('https://www.google.com/maps/dir/Milano/Torino');
+      cases.push({ name: 'parse /maps/dir two places', pass: Array.isArray(p2.places) && p2.places.length >= 2 });
+    } catch (e) {
+      cases.push({ name: 'parse /maps/dir two places', pass: false, info: String(e?.message || e) });
+    }
+
+    return cases;
+  }, []);
+
+  const passed = tests.filter(t => t.pass).length;
+  return (
+    <div className="mt-8 bg-white rounded-2xl border p-4">
+      <h3 className="font-semibold">Pannello test (dev)</h3>
+      <p className="text-sm text-gray-600">{passed}/{tests.length} test passati</p>
+      <ul className="mt-2 list-disc pl-6 text-sm">
+        {tests.map((t, i) => (
+          <li key={i} className={t.pass ? 'text-green-700' : 'text-red-700'}>
+            {t.name} {t.pass ? '✓' : '✗'} {t.info ? `— ${t.info}` : ''}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
