@@ -7,7 +7,7 @@ import React, { useMemo, useState } from "react";
 
 export default function App() {
   const [gmapsUrl, setGmapsUrl] = useState("");
-  const [travelMode, setTravelMode] = useState("driving"); // driving | cycling | walking
+  const [travelMode, setTravelMode] = useState("motorcycle"); // motorcycle | driving | cycling | walking
   const [departLocal, setDepartLocal] = useState(() => new Date().toISOString().slice(0, 16));
   const [sampleKm, setSampleKm] = useState(0); // 0 = solo tappe; >0 = checkpoint ogni X km
   const [loading, setLoading] = useState(false);
@@ -52,10 +52,11 @@ export default function App() {
       // Geocoding punti (origin, waypoints, destination)
       const places = await Promise.all(parsedNow.places.map((p) => ensureCoords(p)));
 
-      // Routing OSRM
-      const profile = travelMode;
+      // Routing OSRM (alias: "motorcycle" usa profilo OSRM "driving")
+      const profile = travelMode; // per UI/summary
+      const osrmProfile = travelMode === "motorcycle" ? "driving" : travelMode;
       const coordsPath = places.map((p) => `${p.lon},${p.lat}`).join(";");
-      const osrmUrl = `https://router.project-osrm.org/route/v1/${profile}/${coordsPath}?overview=full&geometries=geojson&steps=false&annotations=distance,duration`;
+      const osrmUrl = `https://router.project-osrm.org/route/v1/${osrmProfile}/${coordsPath}?overview=full&geometries=geojson&steps=false&annotations=distance,duration`;
       setLoading(true);
       const routeResp = await fetch(osrmUrl);
       if (!routeResp.ok) throw new Error("Errore routing OSRM");
@@ -158,13 +159,23 @@ export default function App() {
         <div className="bg-neutral-800 rounded-2xl shadow p-4 space-y-4">
           <label className="block">
             <span className="text-sm font-medium">Link Google Maps – Indicazioni</span>
-            <input className="mt-1 w-full rounded-xl border border-gray-300 px-3 py-2" placeholder="https://www.google.com/maps/dir/?api=1&origin=...&destination=..." value={gmapsUrl} onChange={(e) => setGmapsUrl(e.target.value)} />
+            <input
+              className="mt-1 w-full rounded-xl border border-gray-600 bg-neutral-700 text-gray-100 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-orange-500"
+              placeholder="https://www.google.com/maps/dir/?api=1&origin=...&destination=..."
+              value={gmapsUrl}
+              onChange={(e) => setGmapsUrl(e.target.value)}
+            />
           </label>
 
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
             <label className="block">
               <span className="text-sm font-medium">Modalità</span>
-              <select className="mt-1 w-full rounded-xl border border-gray-300 px-3 py-2" value={travelMode} onChange={(e) => setTravelMode(e.target.value)}>
+              <select
+                className="mt-1 w-full rounded-xl border border-gray-600 bg-neutral-700 text-gray-100 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-orange-500"
+                value={travelMode}
+                onChange={(e) => setTravelMode(e.target.value)}
+              >
+                <option value="motorcycle">Moto</option>
                 <option value="driving">Auto</option>
                 <option value="cycling">Bici</option>
                 <option value="walking">Piedi</option>
@@ -172,7 +183,11 @@ export default function App() {
             </label>
             <label className="block">
               <span className="text-sm font-medium">Checkpoint ogni</span>
-              <select className="mt-1 w-full rounded-xl border border-gray-300 px-3 py-2" value={String(sampleKm)} onChange={(e) => setSampleKm(parseInt(e.target.value, 10))}>
+              <select
+                className="mt-1 w-full rounded-xl border border-gray-600 bg-neutral-700 text-gray-100 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-orange-500"
+                value={String(sampleKm)}
+                onChange={(e) => setSampleKm(parseInt(e.target.value, 10))}
+              >
                 <option value="0">Solo tappe</option>
                 <option value="10">10 km</option>
                 <option value="20">20 km</option>
@@ -182,22 +197,31 @@ export default function App() {
             </label>
             <label className="block">
               <span className="text-sm font-medium">Partenza</span>
-              <input type="datetime-local" className="mt-1 w-full rounded-xl border border-gray-300 px-3 py-2" value={departLocal} onChange={(e) => setDepartLocal(e.target.value)} />
+<input
+  type="datetime-local"
+  className="mt-1 w-full rounded-xl border border-gray-600 bg-neutral-700 text-gray-100 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-orange-500 [&::-webkit-calendar-picker-indicator]:invert [&::-webkit-calendar-picker-indicator]:opacity-80"
+  value={departLocal}
+  onChange={(e) => setDepartLocal(e.target.value)}
+/>
             </label>
           </div>
 
           <div className="flex gap-3 items-center">
             <button
-  onClick={onRun}
-  disabled={loading || !gmapsUrl.trim()}
-  className="w-full rounded-xl bg-orange-500 hover:bg-orange-500 text-gray-100 py-3 font-extrabold uppercase tracking-wide text-center shadow disabled:opacity-60 disabled:cursor-not-allowed"
->
-  {loading ? "Calcolo…" : "Calcola timeline meteo"}
-</button>
+              onClick={onRun}
+              disabled={loading || !gmapsUrl.trim()}
+              className="w-full rounded-xl bg-orange-500 hover:bg-orange-500 text-gray-100 py-3 font-extrabold uppercase tracking-wide text-center shadow disabled:opacity-60 disabled:cursor-not-allowed"
+            >
+              {loading ? "Calcolo…" : "Calcola timeline meteo"}
+            </button>
             {parsed?.error && <span className="text-sm text-amber-600">{parsed.error}</span>}
           </div>
 
-          {error && <div className="rounded-xl bg-red-50 border border-red-200 p-3 text-sm text-red-700">{error}</div>}
+          {error && (
+            <div className="rounded-xl bg-red-50 border border-red-200 p-3 text-sm text-red-700">
+              {error}
+            </div>
+          )}
         </div>
 
         {result && <ResultView data={result} />}
@@ -208,6 +232,7 @@ export default function App() {
     </div>
   );
 }
+
 
 // === Tests Panel ===
 function TestsPanel({ onPick }) {
@@ -503,44 +528,81 @@ function ResultView({ data }) {
 }
 
 function ResultRow({ wp, idx, total }) {
-  // 1) Colonna 1: ora
+  // Ora
   const dt = new Date(wp.at);
   const hhmm = `${String(dt.getHours()).padStart(2, "0")}:${String(dt.getMinutes()).padStart(2, "0")}`;
 
-
-  // 2) Colonna 2: km cumulati dall'inizio (stesso stile dell'ora)
+  // Km cumulati
   const kmFromStart = Math.round(wp.km || 0);
   const kmLabel = `${kmFromStart} km`;
 
-  // 3) Colonna 3: località (più grande) + sotto solo vento
+  // Località + provincia
   const titleBase = formatPlaceLabel(wp.place);
   const title = wp?.place?.prov ? `${titleBase}, ${wp.place.prov}` : titleBase;
-  const subtitle = formatWindSubtitle(wp); // solo vento
 
-  // 4-5) Colonne 4-5: temperatura + icona meteo
-  const t = wp.weather ? Math.round(wp.weather.temperature_2m) : null;
-  const icon = wp.weather ? weatherCodeToIcon(wp.weather.weathercode) : "—";
+  // Meteo: descrizione, temperatura, icona, vento, pioggia
+  const W = wp.weather;
+  const meteoText = W ? weatherCodeToText(W.weathercode) : "";
+  const temp = W ? Math.round(W.temperature_2m) : null;
+  const icon = W ? weatherCodeToIcon(W.weathercode) : "—";
+  const windTxt = formatWindSubtitle(wp);            // es. "18 km/h"
+  const rainMm = W && Number.isFinite(W.precipitation) ? `${(+W.precipitation).toFixed(1)} mm` : ""; // mm previsti
 
   return (
-    <div className="relative bg-neutral-800 rounded-2xl shadow px-4 py-3">
-      <div className="grid grid-cols-[72px_88px_1fr_72px_56px] items-center gap-3">
-        {/* Colonna 1: Ora */}
-        <div className="text-lg font-mono tabular-nums text-gray-200">{hhmm}</div>
+    <div className="relative bg-neutral-800 rounded-2xl shadow px-4 py-3 overflow-hidden">
+      {/* 
+        Desktop (>= md): 6 colonne in una riga con proporzioni ~ [1/10, 1/10, 5/10, 1/10, 1/10, 1/10]
+          1) Ora
+          2) Km
+          3) Località (sopra) + Descrizione meteo (sotto)
+          4) Temperatura
+          5) Icona meteo
+          6) Pioggia (sopra) + Vento (sotto)
+        Mobile (< md): 4 blocchi orizzontali ~ [1/6, 3/6, 1/6, 1/6], ciascuno impilato (top/bottom)
+          [Ora/Km]  [Località/Descrizione]  [Temperatura/Vento]  [Icona/Pioggia]
+      */}
+      <div
+        className="
+          grid items-center gap-3 md:gap-x-2
+          grid-cols-[1fr_3fr_1fr_1fr]
+          md:grid-cols-[1fr_1fr_4.6fr_1.2fr_0.8fr_1.4fr] /* fr => non sfora col gap; stesse proporzioni */
+        "
+      >
+        {/* MOBILE: blocco 1 (Ora sopra, Km sotto) | DESKTOP: colonna 1 = Ora, colonna 2 = Km */}
+        <div className="flex flex-col md:hidden">
+          <div className="text-lg font-mono tabular-nums text-gray-200">{hhmm}</div>
+          <div className="text-sm font-mono tabular-nums text-gray-400">{kmLabel}</div>
+        </div>
+        <div className="hidden md:block text-lg font-mono tabular-nums text-gray-200">{hhmm}</div>
+        <div className="hidden md:block text-lg font-mono tabular-nums text-gray-400">{kmLabel}</div>
 
-        {/* Colonna 2: separatore + km (monospaced) */}
-        <div className="text-lg font-mono tabular-nums text-gray-400">| {kmLabel}</div>
-
-        {/* Colonna 3: Località + vento */}
-        <div className="overflow-hidden">
+        {/* MOBILE: blocco 2 (Località sopra, Descrizione sotto) | DESKTOP: colonna 3 stack (overflow protetto) */}
+        <div className="overflow-hidden md:min-w-0">
           <div className="text-lg sm:text-xl font-semibold truncate text-gray-100">{title}</div>
-          <div className="text-xs text-gray-400 truncate">{subtitle}</div>
+          <div className="text-xs text-gray-300 truncate">{meteoText}</div>
         </div>
 
-        {/* Colonna 4: Temperatura */}
-        <div className="text-3xl font-bold text-right">{t !== null ? `${t}°` : ""}</div>
+        {/* MOBILE: blocco 3 (Temperatura sopra, Vento sotto) | DESKTOP: colonna 4 = Temp */}
+        <div className="flex flex-col md:hidden items-end">
+          <div className="text-2xl font-bold">{temp !== null ? `${temp}°` : ""}</div>
+          <div className="text-xs text-gray-400">{windTxt}</div>
+        </div>
+        <div className="hidden md:block text-3xl font-bold text-right">{temp !== null ? `${temp}°` : ""}</div>
 
-        {/* Colonna 5: Icona meteo */}
-        <div className="text-2xl text-right" aria-hidden="true">{icon}</div>
+        {/* MOBILE: blocco 4 (Icona sopra, Pioggia mm sotto) | DESKTOP: colonna 5 = Icona, colonna 6 = Pioggia/Vento stack */}
+        <div className="flex flex-col md:hidden items-end">
+          <div className="text-2xl" aria-hidden="true">{icon}</div>
+          <div className="text-xs text-gray-300">{rainMm}</div>
+        </div>
+
+        {/* Desktop: colonna 5 = icona */}
+        <div className="hidden md:block text-2xl text-right" aria-hidden="true">{icon}</div>
+
+        {/* Desktop: colonna 6 = Pioggia sopra + Vento sotto (più compatta, no overflow) */}
+        <div className="hidden md:flex md:flex-col md:items-end overflow-hidden md:min-w-0 max-w-[7rem] md:pr-1">
+          <div className="text-sm text-gray-300 truncate">{rainMm}</div>
+          <div className="text-xs text-gray-400 truncate">{windTxt}</div>
+        </div>
       </div>
     </div>
   );
