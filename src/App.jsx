@@ -225,8 +225,8 @@ function parseGoogleMapsPlace(urlStr) {
 }
 
   return (
-<div className="min-h-screen bg-neutral-900 text-gray-100 flex justify-center p-6 pt-12">
-  <div className="w-full max-w-3xl">
+<div className="min-h-screen w-screen bg-neutral-900 text-gray-100 md:flex md:justify-center p-6 md:pt-12">
+  <div className="w-full max-w-3xl md:mx-auto">
         <header className="mb-6">
 <h1 className="w-full text-center font-extrabold tracking-tight">
   <span className="block text-6xl sm:text-7xl text-orange-500 uppercase leading-none">
