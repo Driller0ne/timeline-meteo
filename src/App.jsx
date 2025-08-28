@@ -63,14 +63,22 @@ export default function App() {
       const route = routeJson.routes?.[0];
       if (!route) throw new Error("Percorso non trovato");
 
-      // Timeline tappe (start + arrivo di ogni leg)
+      // Timeline tappe (start + arrivo di ogni leg) con km cumulati dall'inizio
       let t = new Date(departure);
-      const waypointsSchedule = [{ type: "start", place: places[0], at: new Date(t), legInfo: null }];
+      let cumKm = 0;
+      const waypointsSchedule = [{ type: "start", place: places[0], at: new Date(t), legInfo: null, km: 0 }];
       for (let i = 0; i < route.legs.length; i++) {
         const leg = route.legs[i];
         const to = places[i + 1];
         t = new Date(t.getTime() + leg.duration * 1000);
-        waypointsSchedule.push({ type: "legEnd", place: to, at: new Date(t), legInfo: { distance: leg.distance, duration: leg.duration } });
+        cumKm += (leg.distance || 0) / 1000;
+        waypointsSchedule.push({
+          type: "legEnd",
+          place: to,
+          at: new Date(t),
+          legInfo: { distance: leg.distance, duration: leg.duration },
+          km: cumKm
+        });
       }
 
       // Checkpoint lungo il percorso (opzionali)
@@ -78,19 +86,21 @@ export default function App() {
 
       const allPoints = [...waypointsSchedule, ...samples];
 
-      // Arricchisci i soli checkpoint con un nome località (reverse geocoding), con cache
-      const nameCache = new Map();
+      // Arricchisci i soli checkpoint con Località + Provincia (reverse geocoding), con cache {name, prov}
+      const nameCache = new Map(); // key -> { name, prov }
       for (const wp of allPoints) {
         if (wp.type === "sample" && (!wp.place?.name || String(wp.place.name).startsWith("~km"))) {
           const nk = `${wp.place.lat.toFixed(3)},${wp.place.lon.toFixed(3)}`;
-          if (nameCache.has(nk)) {
-            const nm = nameCache.get(nk);
-            if (nm) wp.place.name = nm;
+          const cached = nameCache.get(nk);
+          if (cached) {
+            if (cached.name) wp.place.name = cached.name;
+            if (cached.prov) wp.place.prov = cached.prov;
           } else {
             try {
-              const nm = await reverseName(wp.place.lat, wp.place.lon);
-              nameCache.set(nk, nm);
-              if (nm) wp.place.name = nm;
+              const info = await reverseName(wp.place.lat, wp.place.lon); // { name, prov } | null
+              nameCache.set(nk, info);
+              if (info?.name) wp.place.name = info.name;
+              if (info?.prov) wp.place.prov = info.prov;
             } catch {}
           }
         }
@@ -128,14 +138,24 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen bg-gray-50 text-gray-900 p-6">
+    <div className="min-h-screen bg-neutral-900 text-gray-100 p-6">
       <div className="max-w-3xl mx-auto">
         <header className="mb-6">
-          <h1 className="text-3xl font-semibold tracking-tight">Timeline Meteo sul Percorso</h1>
+<h1 className="w-full text-center font-extrabold tracking-tight">
+  <span className="block text-6xl sm:text-7xl text-orange-500 uppercase leading-none">
+    RIDEMAPP
+  </span>
+  <span className="block text-3xl sm:text-4xl text-gray-100 uppercase leading-tight">
+    TIMELINE METEO
+  </span>
+  <span className="block text-3xl sm:text-4xl text-gray-100 uppercase leading-tight">
+    SUL PERCORSO
+  </span>
+</h1>
           <p className="text-sm text-gray-600 mt-2">Incolla un link di <strong>Indicazioni Google Maps</strong>, scegli data/ora e (opzionale) checkpoint ogni X km.</p>
         </header>
 
-        <div className="bg-white rounded-2xl shadow p-4 space-y-4">
+        <div className="bg-neutral-800 rounded-2xl shadow p-4 space-y-4">
           <label className="block">
             <span className="text-sm font-medium">Link Google Maps – Indicazioni</span>
             <input className="mt-1 w-full rounded-xl border border-gray-300 px-3 py-2" placeholder="https://www.google.com/maps/dir/?api=1&origin=...&destination=..." value={gmapsUrl} onChange={(e) => setGmapsUrl(e.target.value)} />
@@ -167,9 +187,13 @@ export default function App() {
           </div>
 
           <div className="flex gap-3 items-center">
-            <button onClick={onRun} disabled={loading || !gmapsUrl.trim()} className="rounded-xl bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 font-medium shadow disabled:opacity-60">
-              {loading ? "Calcolo…" : "Calcola timeline meteo"}
-            </button>
+            <button
+  onClick={onRun}
+  disabled={loading || !gmapsUrl.trim()}
+  className="w-full rounded-xl bg-orange-500 hover:bg-orange-500 text-gray-100 py-3 font-extrabold uppercase tracking-wide text-center shadow disabled:opacity-60 disabled:cursor-not-allowed"
+>
+  {loading ? "Calcolo…" : "Calcola timeline meteo"}
+</button>
             {parsed?.error && <span className="text-sm text-amber-600">{parsed.error}</span>}
           </div>
 
@@ -179,7 +203,7 @@ export default function App() {
         {result && <ResultView data={result} />}
 
         {/* Pannello test (dev) */}
-        <DevTests />
+
       </div>
     </div>
   );
@@ -313,7 +337,15 @@ async function geocodeOpenMeteo(q) {
     if (r.ok) {
       const j = await r.json();
       const hit = j?.[0];
-      if (hit) return { name: hit.display_name, lat: parseFloat(hit.lat), lon: parseFloat(hit.lon) };
+      if (hit) {
+  const lat = parseFloat(hit.lat);
+  const lon = parseFloat(hit.lon);
+  // Reverse per ottenere Località + Provincia (sigla)
+  const info = await reverseName(lat, lon);
+  const name = info?.name || hit.name || hit.display_name;
+  const prov = info?.prov || null;
+  return { name, prov, lat, lon };
+}
     }
   } catch {}
   return null;
@@ -327,7 +359,8 @@ async function ensureCoords(place) {
   }
   const g = await geocodeOpenMeteo(raw);
   if (!g) throw new Error(`Geocoding fallito per: ${raw}`);
-  return { ...place, name: g.name, lat: g.lat, lon: g.lon };
+  return { ...place, name: g.name, prov: g.prov ?? place.prov ?? null, lat: g.lat, lon: g.lon };
+
 }
 
 async function reverseName(lat, lon) {
@@ -341,10 +374,68 @@ async function reverseName(lat, lon) {
     const r = await fetch(u.toString(), { headers: { "Accept-Language": "it" } });
     if (!r.ok) return null;
     const j = await r.json();
-    const a = j.address || {};
-    const city = a.village || a.town || a.city || a.hamlet || a.suburb || a.municipality;
-    return city || null;
-  } catch { return null; }
+    return extractCityProv(j);
+  } catch {
+    return null;
+  }
+}
+function extractCityProv(nominatimReverseJson) {
+  const a = nominatimReverseJson?.address || {};
+  // Località sintetica
+  const city = a.village || a.town || a.city || a.hamlet || a.suburb || a.municipality || a.county || a.state_district || a.state;
+  // Provincia (nome lungo, da mappare a sigla): spesso "county" o "state_district"
+  const provName =
+    a.county ||
+    a.state_district ||
+    a.province || // in rari casi esiste
+    null;
+  const prov = toProvCode(provName);
+  return { name: city || null, prov };
+}
+
+function toProvCode(name) {
+  if (!name) return null;
+  const n = String(name).toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
+
+  // Dizionario minimo + alias comuni; espandibile a piacere
+  const map = {
+    "agrigento": "AG", "alessandria": "AL", "ancona": "AN", "aosta": "AO", "aosta valley": "AO",
+    "arezzo": "AR", "ascoli piceno": "AP", "asti": "AT", "avellino": "AV",
+    "bari": "BA", "barletta-andria-trani": "BT", "barletta andria trani": "BT", "belluno": "BL",
+    "benevento": "BN", "bergamo": "BG", "biella": "BI", "bologna": "BO",
+    "bolzano": "BZ", "alto adige": "BZ", "south tyrol": "BZ",
+    "brescia": "BS", "brindisi": "BR", "cagliari": "CA", "caltanissetta": "CL", "campobasso": "CB",
+    "caserta": "CE", "catania": "CT", "catanzaro": "CZ", "chieti": "CH", "como": "CO", "cosenza": "CS",
+    "cremona": "CR", "crotone": "KR", "cuneo": "CN",
+    "enna": "EN", "fermo": "FM", "ferrara": "FE", "firenze": "FI", "florence": "FI",
+    "foggia": "FG", "forli-cesena": "FC", "forli cesena": "FC", "frosinone": "FR",
+    "genova": "GE", "la spezia": "SP", "gorizia": "GO", "grosseto": "GR",
+    "imperia": "IM", "isernia": "IS", "l'aquila": "AQ", "laquila": "AQ", "laquila province": "AQ",
+    "latina": "LT", "lecce": "LE", "lecco": "LC", "livorno": "LI", "lodi": "LO", "lucca": "LU",
+    "macerata": "MC", "mantova": "MN", "massa-carrara": "MS", "massa carrara": "MS",
+    "matera": "MT", "messina": "ME", "milano": "MI", "modena": "MO", "monza e della brianza": "MB",
+    "napoli": "NA", "novara": "NO", "nuoro": "NU", "oristano": "OR", "padova": "PD", "palermo": "PA",
+    "parma": "PR", "pavia": "PV", "perugia": "PG", "pescara": "PE", "piacenza": "PC", "pisa": "PI",
+    "pistoia": "PT", "pordenone": "PN", "potenza": "PZ", "prato": "PO", "rafa": "RA", // Ravenna alias safe
+    "ragusa": "RG", "ravenna": "RA", "reggio calabria": "RC", "reggio nell'emilia": "RE", "reggio emilia": "RE",
+    "rieti": "RI", "rimini": "RN", "roma": "RM", "rome": "RM", "rovigo": "RO",
+    "salerno": "SA", "sassari": "SS", "savona": "SV", "siena": "SI", "siracusa": "SR", "sondrio": "SO",
+    "sud sardegna": "SU", "taranto": "TA", "tempio pausania-olbia": "OT", "teramo": "TE", "terni": "TR",
+    "torino": "TO", "trapani": "TP", "trento": "TN", "treviso": "TV", "trieste": "TS",
+    "udine": "UD", "varese": "VA", "venezia": "VE", "verbania": "VB", "verbano-cusio-ossola": "VB",
+    "verona": "VR", "vibo valentia": "VV", "vicenza": "VI", "viterbo": "VT",
+    // Sigle già in forma "provincia di XX"
+    "provincia di trento": "TN", "provincia autonoma di bolzano": "BZ", "provincia autonoma di trento": "TN",
+  };
+
+  // Pulizia comune tipo "Provincia di XXX", "Città metropolitana di XXX"
+  const cleaned = n
+    .replace(/^provincia (autonoma )?di\s+/i, "")
+    .replace(/^citta metropolitana di\s+/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return map[cleaned] || null;
 }
 
 async function fetchWeatherForWindow(lat, lon, start, end) {
@@ -396,47 +487,80 @@ function ResultView({ data }) {
   const totalDur = formatDuration(data.summary.duration);
   return (
     <div className="mt-6">
-      <div className="bg-white rounded-2xl shadow p-4 mb-4">
-        <h2 className="text-xl font-semibold">Riepilogo</h2>
-        <p className="text-sm text-gray-700 mt-1">Profilo: <span className="font-mono">{data.profile}</span> · Totale: {totalKm} km · {totalDur}</p>
-      </div>
+<div className="bg-neutral-800 rounded-2xl shadow p-4 mb-4">
+  <h2 className="text-xl font-semibold text-orange-500">Riepilogo</h2>
+  <p className="text-sm text-gray-100 mt-1">
+    Profilo: <span className="font-mono">{data.profile}</span> · Totale: {totalKm} km · {totalDur}
+  </p>
+</div>
       <div className="space-y-4">
         {data.schedule.map((wp, idx) => (
-          <TimelineCard key={idx} wp={wp} idx={idx} total={data.schedule.length} />
+          <ResultRow key={idx} wp={wp} idx={idx} total={data.schedule.length} />
         ))}
       </div>
     </div>
   );
 }
 
-function TimelineCard({ wp, idx, total }) {
-  const isStart = wp.type === "start"; const isFinal = idx === total - 1; const leg = wp.legInfo;
-  let label; if (isStart) label = "Partenza"; else if (isFinal) label = "Arrivo"; else if (wp.type === "sample") label = `Checkpoint ~${Math.round(wp.km)} km`; else label = `Arrivo tappa ${idx}`;
+function ResultRow({ wp, idx, total }) {
+  // 1) Colonna 1: ora
+  const dt = new Date(wp.at);
+  const hhmm = `${String(dt.getHours()).padStart(2, "0")}:${String(dt.getMinutes()).padStart(2, "0")}`;
+
+
+  // 2) Colonna 2: km cumulati dall'inizio (stesso stile dell'ora)
+  const kmFromStart = Math.round(wp.km || 0);
+  const kmLabel = `${kmFromStart} km`;
+
+  // 3) Colonna 3: località (più grande) + sotto solo vento
+  const titleBase = formatPlaceLabel(wp.place);
+  const title = wp?.place?.prov ? `${titleBase}, ${wp.place.prov}` : titleBase;
+  const subtitle = formatWindSubtitle(wp); // solo vento
+
+  // 4-5) Colonne 4-5: temperatura + icona meteo
+  const t = wp.weather ? Math.round(wp.weather.temperature_2m) : null;
+  const icon = wp.weather ? weatherCodeToIcon(wp.weather.weathercode) : "—";
+
   return (
-    <div className="relative bg-white rounded-2xl shadow p-4">
-      <div className="flex items-start gap-4">
-        <div className="mt-1"><div className={`w-3 h-3 rounded-full ${isStart ? "bg-green-500" : isFinal ? "bg-purple-500" : "bg-blue-500"}`} /></div>
-        <div className="flex-1">
-          <div className="flex flex-wrap items-center gap-2"><span className="text-xs uppercase tracking-wider text-gray-500">{label}</span><span className="text-sm font-medium">{formatPlaceLabel(wp.place)}</span></div>
-          <div className="mt-1 text-sm text-gray-700"><span className="font-medium">{new Date(wp.at).toLocaleString()}</span>{leg && (<><span className="mx-2 text-gray-400">•</span><span>{(leg.distance / 1000).toFixed(1)} km</span><span className="mx-2 text-gray-400">•</span><span>{formatDuration(leg.duration)}</span></>)}</div>
-          {wp.weather ? (
-            <div className="mt-2 rounded-xl bg-sky-50 border border-sky-100 p-3 text-sm">
-              <div className="flex flex-wrap items-center gap-3">
-                <span className="font-medium">Meteo previsto</span>
-                <span className="text-gray-700">{weatherCodeToText(wp.weather.weathercode)}</span>
-                <span className="text-gray-400">•</span>
-                <span>🌡️ {Math.round(wp.weather.temperature_2m)}°C</span>
-                <span className="text-gray-400">•</span>
-                <span>💨 {Math.round(wp.weather.wind_speed_10m)} km/h</span>
-                <span className="text-gray-400">•</span>
-                <span>☔ {wp.weather.precipitation?.toFixed(1)} mm</span>
-              </div>
-            </div>
-          ) : (<p className="mt-2 text-sm text-gray-500">Meteo non disponibile per questa ora.</p>)}
+    <div className="relative bg-neutral-800 rounded-2xl shadow px-4 py-3">
+      <div className="grid grid-cols-[72px_88px_1fr_72px_56px] items-center gap-3">
+        {/* Colonna 1: Ora */}
+        <div className="text-lg font-mono tabular-nums text-gray-200">{hhmm}</div>
+
+        {/* Colonna 2: separatore + km (monospaced) */}
+        <div className="text-lg font-mono tabular-nums text-gray-400">| {kmLabel}</div>
+
+        {/* Colonna 3: Località + vento */}
+        <div className="overflow-hidden">
+          <div className="text-lg sm:text-xl font-semibold truncate text-gray-100">{title}</div>
+          <div className="text-xs text-gray-400 truncate">{subtitle}</div>
         </div>
+
+        {/* Colonna 4: Temperatura */}
+        <div className="text-3xl font-bold text-right">{t !== null ? `${t}°` : ""}</div>
+
+        {/* Colonna 5: Icona meteo */}
+        <div className="text-2xl text-right" aria-hidden="true">{icon}</div>
       </div>
     </div>
   );
+}
+
+function formatWindSubtitle(wp) {
+  const W = wp.weather;
+  if (!W) return "";
+  const ws = Math.round(W.wind_speed_10m || 0);
+  return `${ws} km/h`;
+}
+function weatherCodeToIcon(code) {
+  // Set minimale di pittogrammi/emoji coerenti col testo
+  if (code === 0) return "☀️";
+  if ([1, 2, 3].includes(code)) return "⛅";
+  if ([45, 48].includes(code)) return "🌫️";
+  if ([51, 53, 55, 61, 63, 65, 80, 81, 82].includes(code)) return "🌧️";
+  if ([71, 73, 75, 77, 85, 86].includes(code)) return "❄️";
+  if ([95, 96, 99].includes(code)) return "⛈️";
+  return "🌡️";
 }
 
 function weatherCodeToText(code) { const map = { 0: "Sereno", 1: "Prevalentemente sereno", 2: "Parzialmente nuvoloso", 3: "Coperto", 45: "Nebbia", 48: "Nebbia con brina", 51: "Pioviggine leggera", 53: "Pioviggine", 55: "Pioviggine intensa", 56: "Pioggia gelata leggera", 57: "Pioggia gelata", 61: "Pioggia debole", 63: "Pioggia", 65: "Pioggia forte", 66: "Rovescio gelato leggero", 67: "Rovescio gelato", 71: "Neve debole", 73: "Neve", 75: "Neve forte", 77: "Granelli di neve", 80: "Rovesci leggeri", 81: "Rovesci", 82: "Rovesci intensi", 85: "Rovesci di neve leggeri", 86: "Rovesci di neve intensi", 95: "Temporale", 96: "Temporale con grandine", 99: "Temporale con grandine forte" }; return map?.[code] ?? `Codice meteo ${code}`; }
