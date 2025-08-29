@@ -5,22 +5,28 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 
     <!-- ======= Favicons / App icons ======= -->
-    <link rel="icon" href="/favicon.ico" sizes="any" />
+    <!-- SVG per browser moderni -->
+    <link rel="icon" type="image/svg+xml" href="/logo.svg" />
+
+    <!-- PNG fallback -->
     <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png" />
     <link rel="icon" type="image/png" sizes="192x192" href="/favicon-192x192.png" />
+
+    <!-- Apple iOS -->
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+
+    <!-- Manifest PWA -->
     <link rel="manifest" href="/site.webmanifest" />
 
-    <!-- Meta opzionali per colori UI -->
-    <meta name="theme-color" content="#111827" />
+    <!-- UI colors -->
+    <meta name="theme-color" content="#ff6600" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
 
     <!-- Titolo -->
     <title>RideMApp</title>
 
-    <!-- Tailwind via CDN (lasciato come nel tuo file). 
-         Se usi Tailwind tramite build Vite, puoi rimuovere questa riga. -->
+    <!-- Tailwind (CDN, se non lo usi via build Vite) -->
     <script src="https://cdn.tailwindcss.com"></script>
   </head>
   <body class="bg-neutral-900 text-gray-100">
