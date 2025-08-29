@@ -15,12 +15,17 @@ export default function App() {
   const [result, setResult] = useState(null);
   const [resolvedUrl, setResolvedUrl] = useState("");
 
-  // Preview parsing per feedback immediato
+  // Preview parsing per feedback immediato (directions OR single place)
   const parsed = useMemo(() => {
+    if (!resolvedUrl) return null;
     try {
-      return resolvedUrl ? parseGoogleMapsDirections(resolvedUrl) : null;
-    } catch (e) {
-      return { error: (e && e.message) || String(e) };
+      return { kind: "directions", ...parseGoogleMapsDirections(resolvedUrl) };
+    } catch (e1) {
+      try {
+        return { kind: "place", ...parseGoogleMapsPlace(resolvedUrl) };
+      } catch (e2) {
+        return { error: (e1 && e1.message) || (e2 && e2.message) || "URL non riconosciuto" };
+      }
     }
   }, [resolvedUrl]);
 
@@ -28,35 +33,69 @@ export default function App() {
     setError("");
     setResult(null);
     setResolvedUrl("");
+
     try {
       let urlToUse = gmapsUrl.trim();
-      if (!urlToUse) throw new Error("Incolla un link di Indicazioni Google Maps valido.");
+      if (!urlToUse) throw new Error("Incolla un link di Google Maps (Indicazioni o Posizione singola).");
 
       // Espansione link corto, se necessario
       if (isShortGmaps(urlToUse)) {
         const exp = await expandShortMaps(urlToUse);
-        if (exp) {
-          urlToUse = exp;
-        } else {
-          setError("Questo è un link corto di Google Maps che non posso espandere automaticamente. Apri il link, tocca \"Apri in Google Maps\" e copia l'URL completo delle Indicazioni.");
+        if (exp) urlToUse = exp;
+        else {
+          setError("Questo è un link corto di Google Maps che non posso espandere automaticamente. Apri il link, tocca \"Apri in Google Maps\" e copia l'URL completo.");
           setLoading(false);
           return;
         }
       }
       setResolvedUrl(urlToUse);
 
-      const parsedNow = parseGoogleMapsDirections(urlToUse);
+      // Prova a interpretare come DIRECTIONS, altrimenti come PLACE
+      let parsedNow;
+      try {
+        parsedNow = { kind: "directions", ...parseGoogleMapsDirections(urlToUse) };
+      } catch {
+        parsedNow = { kind: "place", ...parseGoogleMapsPlace(urlToUse) };
+      }
+
       const departure = new Date(departLocal);
       if (isNaN(+departure)) throw new Error("Data/ora di partenza non valida");
 
-      // Geocoding punti (origin, waypoints, destination)
+      const profile = travelMode; // per UI
+      const nameCache = new Map();
+
+      if (parsedNow.kind === "place") {
+        // === Caso POSIZIONE SINGOLA: niente routing, 1 solo punto ===
+        const place = await ensureCoords(parsedNow.place);
+        // Finestra meteo stretta (±12h come già fai)
+        const meteo = await fetchWeatherForWindow(place.lat, place.lon, departure, departure);
+        const weather = pickHourlyForDate(meteo, departure);
+
+        // Reverse per nome/prov se non già presenti
+        if (!place.name || !place.prov) {
+          try {
+            const info = await reverseName(place.lat, place.lon);
+            if (info?.name) place.name = info.name;
+            if (info?.prov) place.prov = info.prov;
+          } catch {}
+        }
+
+        setResult({
+          summary: { distance: 0, duration: 0, legs: 0 },
+          schedule: [{ type: "point", place, at: departure, legInfo: null, km: 0, weather }],
+          profile,
+        });
+        return;
+      }
+
+      // === Caso INDICAZIONI: flusso originale invariato ===
       const places = await Promise.all(parsedNow.places.map((p) => ensureCoords(p)));
 
-      // Routing OSRM (alias: "motorcycle" usa profilo OSRM "driving")
-      const profile = travelMode; // per UI/summary
+      // Routing OSRM (alias: "motorcycle" => driving)
       const osrmProfile = travelMode === "motorcycle" ? "driving" : travelMode;
       const coordsPath = places.map((p) => `${p.lon},${p.lat}`).join(";");
       const osrmUrl = `https://router.project-osrm.org/route/v1/${osrmProfile}/${coordsPath}?overview=full&geometries=geojson&steps=false&annotations=distance,duration`;
+
       setLoading(true);
       const routeResp = await fetch(osrmUrl);
       if (!routeResp.ok) throw new Error("Errore routing OSRM");
@@ -64,7 +103,7 @@ export default function App() {
       const route = routeJson.routes?.[0];
       if (!route) throw new Error("Percorso non trovato");
 
-      // Timeline tappe (start + arrivo di ogni leg) con km cumulati dall'inizio
+      // Timeline (start + fine di ogni leg)
       let t = new Date(departure);
       let cumKm = 0;
       const waypointsSchedule = [{ type: "start", place: places[0], at: new Date(t), legInfo: null, km: 0 }];
@@ -78,17 +117,22 @@ export default function App() {
           place: to,
           at: new Date(t),
           legInfo: { distance: leg.distance, duration: leg.duration },
-          km: cumKm
+          km: cumKm,
         });
       }
 
-      // Checkpoint lungo il percorso (opzionali)
-      const samples = generateRouteSamples(route.geometry?.coordinates, route.distance, route.duration, departure, sampleKm);
+      // Checkpoint (opzionali)
+      const samples = generateRouteSamples(
+        route.geometry?.coordinates,
+        route.distance,
+        route.duration,
+        departure,
+        sampleKm
+      );
 
       const allPoints = [...waypointsSchedule, ...samples];
 
-      // Arricchisci i soli checkpoint con Località + Provincia (reverse geocoding), con cache {name, prov}
-      const nameCache = new Map(); // key -> { name, prov }
+      // Reverse name per i soli checkpoint senza nome
       for (const wp of allPoints) {
         if (wp.type === "sample" && (!wp.place?.name || String(wp.place.name).startsWith("~km"))) {
           const nk = `${wp.place.lat.toFixed(3)},${wp.place.lon.toFixed(3)}`;
@@ -98,7 +142,7 @@ export default function App() {
             if (cached.prov) wp.place.prov = cached.prov;
           } else {
             try {
-              const info = await reverseName(wp.place.lat, wp.place.lon); // { name, prov } | null
+              const info = await reverseName(wp.place.lat, wp.place.lon);
               nameCache.set(nk, info);
               if (info?.name) wp.place.name = info.name;
               if (info?.prov) wp.place.prov = info.prov;
@@ -107,7 +151,7 @@ export default function App() {
         }
       }
 
-      // Meteo: finestra comune
+      // Meteo finestra comune
       const startAt = new Date(waypointsSchedule[0].at);
       const endAt = new Date(waypointsSchedule[waypointsSchedule.length - 1].at);
       const weatherByKey = new Map();
@@ -137,10 +181,52 @@ export default function App() {
       setLoading(false);
     }
   }
+// ——— Parsing Google Maps: POSIZIONE SINGOLA ———
+// Supporta vari formati: /maps/place/..., /maps/search/?q=..., /maps/@lat,lon,zoom, o query 'q=lat,lon'
+function parseGoogleMapsPlace(urlStr) {
+  let url; try { url = new URL(urlStr); } catch { throw new Error("URL non valido"); }
+  if (url.hostname === "maps.app.goo.gl") throw new Error("Link corto: verrà espanso");
+
+  // 1) /maps/place/NAME/... oppure /maps/search/...
+  if (url.pathname.startsWith("/maps/place/") || url.pathname.startsWith("/maps/search/")) {
+    const segs = url.pathname.split("/").filter(Boolean);
+    // prova a prendere il segmento dopo 'place' o 'search' come nome
+    const idx = segs.findIndex(s => s === "place" || s === "search");
+    let placeName = segs[idx + 1] ? decodeURIComponent(segs[idx + 1]) : null;
+
+    // se presente "@lat,lon," nel path, usalo
+    const at = url.pathname.match(/@(-?\d+(\.\d+)?),(-?\d+(\.\d+)?),/);
+    if (at) {
+      const lat = parseFloat(at[1]);
+      const lon = parseFloat(at[3]);
+      return { place: { raw: placeName || `${lat},${lon}` } };
+    }
+
+    // se c'è ?q=lat,lon o ?q=Nome, usa quello
+    const q = url.searchParams.get("q");
+    if (q) return { place: { raw: decodeURIComponent(q) } };
+
+    if (placeName) return { place: { raw: placeName } };
+  }
+
+  // 2) /maps/@lat,lon,zoom
+  const at = url.pathname.match(/\/@(-?\d+(\.\d+)?),(-?\d+(\.\d+)?),/);
+  if (at) {
+    const lat = parseFloat(at[1]);
+    const lon = parseFloat(at[3]);
+    return { place: { raw: `${lat},${lon}` } };
+  }
+
+  // 3) ?q=lat,lon oppure ?q=Nome
+  const q = url.searchParams.get("q");
+  if (q) return { place: { raw: decodeURIComponent(q) } };
+
+  throw new Error("Questo link non contiene una posizione riconoscibile");
+}
 
   return (
-    <div className="min-h-screen bg-neutral-900 text-gray-100 p-6">
-      <div className="max-w-3xl mx-auto">
+<div className="min-h-screen w-screen bg-neutral-900 text-gray-100 md:flex md:justify-center p-6 md:pt-12">
+  <div className="w-full max-w-3xl md:mx-auto">
         <header className="mb-6">
 <h1 className="w-full text-center font-extrabold tracking-tight">
   <span className="block text-6xl sm:text-7xl text-orange-500 uppercase leading-none">
