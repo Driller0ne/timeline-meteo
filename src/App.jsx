@@ -449,18 +449,24 @@ async function geocodeOpenMeteo(q) {
       const j = await r.json();
       const hit = j?.[0];
       if (hit) {
-  const lat = parseFloat(hit.lat);
-  const lon = parseFloat(hit.lon);
-  // Reverse per ottenere Località + Provincia (sigla)
-  const info = await reverseName(lat, lon);
-  const name = info?.name || hit.name || hit.display_name;
-  const prov = info?.prov || null;
-  return { name, prov, lat, lon };
-}
+        const lat = parseFloat(hit.lat);
+        const lon = parseFloat(hit.lon);
+
+        // Reverse per Località + Provincia (SIGLA) -> best-effort:
+        // se fallisce, usiamo comunque i dati di Nominatim.
+        let info = null;
+        try {
+          info = await reverseName(lat, lon);
+        } catch {}
+
+        const resolvedName = info?.name || hit.name || hit.display_name || name;
+        const prov = info?.prov || null;
+
+        return { name: resolvedName, prov, lat, lon };
+      }
     }
   } catch {}
   return null;
-}
 
 async function ensureCoords(place) {
   const raw = normalizeRaw(String(place.raw));
