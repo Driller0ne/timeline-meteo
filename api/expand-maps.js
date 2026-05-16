@@ -2,6 +2,18 @@
 //
 // Vercel serverless function: espande short link di Google Maps in URL completi.
 //
+// v2.15 — Blocco 4, finale:
+//  - Aggiunto fallback "headless renderer" (provider-agnostic) per i link
+//    maps.app.goo.gl che Google serve come Firebase Dynamic Links page
+//    (risoluzione client-side JS, impossibile via fetch standard).
+//  - Provider attualmente supportato: ScrapingBee (variabile d'ambiente
+//    SCRAPINGBEE_API_KEY su Vercel). Se la key non è configurata o i
+//    credits sono esauriti, il proxy cade silenziosamente nei fallback
+//    standard e ritorna il messaggio di errore "workaround manuale".
+//  - Architettura: il provider è isolato in una funzione `tryHeadless()`,
+//    facile da sostituire con Crawlbase, Browserless o self-hosted Puppeteer
+//    in futuro senza toccare il resto del codice.
+//
 // v2.14b — Blocco 4, follow-up:
 //  - Strategia ibrida: prima tenta redirect HTTP classico, poi se non c'è
 //    Location header (Google a volte restituisce HTML con redirect JS),
@@ -9,6 +21,25 @@
 //    canonical, og:url, script).
 //  - Headers super-realistici (Sec-Fetch-*, Upgrade-Insecure-Requests).
 //  - Debug info nel response in caso di fallimento, per troubleshooting rapido.
+
+// ============================================================================
+// CONFIGURAZIONE PROVIDER HEADLESS RENDERER
+// ----------------------------------------------------------------------------
+// Per cambiare provider in futuro (es. Crawlbase pay-as-you-go), sostituisci
+// la funzione `tryHeadless()` più sotto con la nuova logica. Il resto del
+// codice resta invariato.
+//
+// Variabili d'ambiente attese (impostare su Vercel → Settings → Env Vars):
+//   SCRAPINGBEE_API_KEY = la chiave ottenuta da scrapingbee.com
+//
+// Se la variabile non è impostata, il fallback headless viene saltato
+// silenziosamente (la function continua a fare il fallback HTTP normale).
+// ============================================================================
+
+// Vercel: chiediamo fino a 30s di esecuzione (il fallback ScrapingBee
+// con JS rendering può richiedere 5-10s + il resto della logica).
+// Hobby tier supporta fino a 60s con questa direttiva.
+export const config = { maxDuration: 30 };
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -303,16 +334,135 @@ export default async function handler(req, res) {
         return res.status(200).json({ ok: true, url: fromHtml, via: 'html-extracted', debug });
       }
 
-      // Nessun progresso possibile
+      // Nessun progresso possibile con HTTP+HTML parsing.
+      // Last resort: provider headless (ScrapingBee o equivalente).
       break;
+    }
+
+    // ===== FALLBACK FINALE: headless renderer =====
+    // Se l'URL è ancora uno short link (= il loop non l'ha espanso),
+    // proviamo con ScrapingBee. Se la chiave non è configurata o fallisce,
+    // ritorniamo 502 col debug.
+    const stillShort = (() => {
+      try { return SHORT_HOSTS.has(new URL(current).hostname); }
+      catch { return false; }
+    })();
+
+    if (stillShort) {
+      const headlessResult = await tryHeadless(current, debug);
+      if (headlessResult?.url) {
+        let finalUrl = headlessResult.url;
+        // Se anche l'headless ci dà un consent.google.com, estraiamo continue=
+        try {
+          const fh = new URL(finalUrl).hostname;
+          if (CONSENT_HOSTS.has(fh)) {
+            const real = extractFromConsent(finalUrl);
+            if (real) finalUrl = real;
+          }
+        } catch {}
+        return res.status(200).json({
+          ok: true,
+          url: finalUrl,
+          via: headlessResult.via,
+          debug,
+        });
+      }
     }
 
     return res.status(502).json({
       ok: false,
-      error: 'Could not expand (no redirect or HTML pattern found)',
+      error: 'Could not expand (no redirect, no HTML pattern, headless fallback unavailable or failed)',
       debug,
     });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e?.message || String(e), debug });
+  }
+
+  // ==========================================================================
+  // tryHeadless(): provider-agnostic headless rendering.
+  // Restituisce { url, via } se trova l'URL Maps, null altrimenti.
+  // Provider corrente: ScrapingBee. Per cambiare provider in futuro,
+  // sostituisci solo il corpo di questa funzione.
+  // ==========================================================================
+  async function tryHeadless(shortUrl, debugLog) {
+    const SCRAPINGBEE_KEY = process.env.SCRAPINGBEE_API_KEY;
+    const hopInfo = { i: 'headless', provider: 'scrapingbee', shortUrl };
+
+    if (!SCRAPINGBEE_KEY) {
+      hopInfo.skipped = 'no SCRAPINGBEE_API_KEY env var';
+      debugLog.push(hopInfo);
+      return null;
+    }
+
+    try {
+      // Costruisco la richiesta a ScrapingBee
+      const sbUrl = new URL('https://app.scrapingbee.com/api/v1/');
+      sbUrl.searchParams.set('api_key', SCRAPINGBEE_KEY);
+      sbUrl.searchParams.set('url', shortUrl);
+      sbUrl.searchParams.set('render_js', 'true');
+      // Aspetta 3.5s dopo il page load, per dare tempo al JS Firebase di
+      // fare il suo redirect (di solito ~1-2s, ma diamo margine).
+      sbUrl.searchParams.set('wait', '3500');
+      // Blocca immagini/CSS per velocizzare il rendering (default è già true,
+      // ma esplicitiamolo).
+      sbUrl.searchParams.set('block_resources', 'true');
+      // Restituisci HTML finale, non screenshot.
+      sbUrl.searchParams.set('return_page_source', 'true');
+
+      // Timeout interno: 12s (ScrapingBee ha sua propria timeout di rete)
+      const ctrl = new AbortController();
+      const tid = setTimeout(() => ctrl.abort(), 12000);
+
+      let sbResp;
+      try {
+        sbResp = await fetch(sbUrl.toString(), { signal: ctrl.signal });
+      } finally {
+        clearTimeout(tid);
+      }
+
+      hopInfo.scrapingBeeStatus = sbResp.status;
+
+      // ScrapingBee espone l'URL finale (dopo redirect) nell'header Spb-resolved-url.
+      const resolvedFromHeader = sbResp.headers.get('Spb-resolved-url') ||
+                                  sbResp.headers.get('spb-resolved-url');
+      hopInfo.resolvedHeader = resolvedFromHeader;
+
+      // Caso 1: l'header dà già l'URL finale, e non è uno short
+      if (resolvedFromHeader) {
+        try {
+          const rHost = new URL(resolvedFromHeader).hostname;
+          if (!SHORT_HOSTS.has(rHost)) {
+            debugLog.push(hopInfo);
+            return { url: resolvedFromHeader, via: 'scrapingbee-header' };
+          }
+        } catch {}
+      }
+
+      // Caso 2: parse del body HTML (Google Maps web ha canonical + og:url)
+      if (sbResp.ok) {
+        const sbHtml = await sbResp.text();
+        hopInfo.htmlBytes = sbHtml.length;
+        const fromHtml = extractMapsUrlFromHtml(sbHtml);
+        hopInfo.fromHtml = fromHtml;
+        if (fromHtml) {
+          debugLog.push(hopInfo);
+          return { url: fromHtml, via: 'scrapingbee-html' };
+        }
+      } else {
+        // Errore esplicito da ScrapingBee (es. 401 chiave invalida,
+        // 402 no credits, 422 url invalido, 500 server error)
+        try {
+          const errText = await sbResp.text();
+          hopInfo.scrapingBeeError = errText.slice(0, 500);
+        } catch {}
+      }
+
+      debugLog.push(hopInfo);
+      return null;
+    } catch (e) {
+      hopInfo.exception = e?.message || String(e);
+      debugLog.push(hopInfo);
+      return null;
+    }
   }
 }
