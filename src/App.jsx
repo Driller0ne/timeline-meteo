@@ -3,6 +3,24 @@ import React, { useMemo, useState } from "react";
 /**
  * App: Timeline Meteo sul Percorso
  *
+ * v2.14 — Blocco 4 (client-side, link iPhone/Apple/consent EU):
+ *  18. Aggiunto parser per il formato legacy `?saddr=...&daddr=...&dirflg=...`
+ *      usato dagli URL Google Maps espansi da short link iPhone.
+ *      Supporta waypoints multipli separati da " to:" o "+to:".
+ *      dirflg → travelmode: d=driving, w=walking, b=bicycling, r=transit.
+ *  19. Aggiunto unwrap automatico di `consent.google.com/...?continue=...`:
+ *      se l'utente incolla direttamente un URL di consent EU (es. dopo aver
+ *      espanso uno short link su unshorten.me), il vero URL Maps viene
+ *      estratto automaticamente dal parametro `continue=`.
+ *  20. Aggiunto parser per `maps.apple.com/?...` (Apple Maps): supporta
+ *      ll=lat,lon, q=Nome, address=Indirizzo, saddr+daddr per Directions.
+ *  21. Per i link `maps.app.goo.gl` che NON si riescono ad espandere dal proxy
+ *      (Google ora usa Firebase Dynamic Links con risoluzione client-side JS),
+ *      l'utente può: (a) aprire il link in un browser desktop, attendere il
+ *      redirect a Google Maps, copiare l'URL completo; oppure (b) usare un
+ *      servizio terzo di unshortening. In entrambi i casi l'URL risultante
+ *      viene ora parsato correttamente grazie ai fix 18-20.
+ *
  * v2.13 — Blocco 3, follow-up: indirizzi italiani complessi
  *  17. Strategia "hint progressivi": per ogni tappa proviamo varie versioni
  *      della query, dalla più completa alla più generica. Esempio:
@@ -61,14 +79,22 @@ export default function App() {
   const [result, setResult] = useState(null);
   const [resolvedUrl, setResolvedUrl] = useState("");
 
-  // Preview parsing per feedback immediato (directions OR single place)
+  // Preview parsing per feedback immediato (directions OR single place OR Apple Maps).
+  // Nota: applichiamo PRIMA unwrapConsentUrl per estrarre l'URL Maps reale
+  // se l'utente ha incollato un URL consent.google.com/...?continue=...
   const parsed = useMemo(() => {
     if (!resolvedUrl) return null;
+    const unwrapped = unwrapConsentUrl(resolvedUrl);
+    // Apple Maps ha priorità (parser specifico)
+    if (/^https?:\/\/maps\.apple\.com/i.test(unwrapped)) {
+      try { return parseAppleMaps(unwrapped); }
+      catch (eA) { return { error: eA?.message || "URL Apple Maps non valido" }; }
+    }
     try {
-      return { kind: "directions", ...parseGoogleMapsDirections(resolvedUrl) };
+      return { kind: "directions", ...parseGoogleMapsDirections(unwrapped) };
     } catch (e1) {
       try {
-        return { kind: "place", ...parseGoogleMapsPlace(resolvedUrl) };
+        return { kind: "place", ...parseGoogleMapsPlace(unwrapped) };
       } catch (e2) {
         return { error: (e1 && e1.message) || (e2 && e2.message) || "URL non riconosciuto" };
       }
@@ -82,25 +108,39 @@ export default function App() {
 
     try {
       let urlToUse = gmapsUrl.trim();
-      if (!urlToUse) throw new Error("Incolla un link di Google Maps (Indicazioni o Posizione singola).");
+      if (!urlToUse) throw new Error("Incolla un link di Google Maps o Apple Maps (Indicazioni o Posizione singola).");
+
+      // FIX #19 (v2.14): se l'utente ha incollato un URL consent.google.com,
+      // estraiamo il vero URL Maps dal parametro `continue=`
+      urlToUse = unwrapConsentUrl(urlToUse);
 
       // Espansione link corto, se necessario
       if (isShortGmaps(urlToUse)) {
         const exp = await expandShortMaps(urlToUse);
-        if (exp) urlToUse = exp;
+        if (exp) urlToUse = unwrapConsentUrl(exp); // anche l'espanso può finire su consent
         else {
-          setError("Questo è un link corto di Google Maps che non posso espandere automaticamente. Apri il link, tocca \"Apri in Google Maps\" e copia l'URL completo.");
+          setError(
+            "Non sono riuscito a espandere questo link corto di Google Maps. " +
+            "Apri il link in un browser desktop (Chrome/Safari), attendi che si apra Google Maps, " +
+            "copia l'URL completo dalla barra del browser e incollalo qui."
+          );
           return;
         }
       }
       setResolvedUrl(urlToUse);
 
-      // Prova a interpretare come DIRECTIONS, altrimenti come PLACE
+      // Determina il parser appropriato in base all'host
+      // FIX #20 (v2.14): supporto Apple Maps
       let parsedNow;
-      try {
-        parsedNow = { kind: "directions", ...parseGoogleMapsDirections(urlToUse) };
-      } catch {
-        parsedNow = { kind: "place", ...parseGoogleMapsPlace(urlToUse) };
+      if (/^https?:\/\/maps\.apple\.com/i.test(urlToUse)) {
+        parsedNow = parseAppleMaps(urlToUse);
+      } else {
+        // Google Maps: prova directions, poi place
+        try {
+          parsedNow = { kind: "directions", ...parseGoogleMapsDirections(urlToUse) };
+        } catch {
+          parsedNow = { kind: "place", ...parseGoogleMapsPlace(urlToUse) };
+        }
       }
 
       const departure = new Date(departLocal);
@@ -286,8 +326,8 @@ export default function App() {
               SUL PERCORSO
             </span>
           </h1>
-          <p className="text-sm text-gray-600 mt-2">
-            Incolla un link di <strong>Google Maps</strong> (Indicazioni o Posizione singola),
+          <p className="text-sm text-gray-400 mt-2">
+            Incolla un link di <strong>Google Maps</strong> o <strong>Apple Maps</strong> (Indicazioni o Posizione singola),
             scegli data/ora e (opzionale) checkpoint ogni X km.
           </p>
         </header>
@@ -408,6 +448,78 @@ async function expandShortMaps(shortUrl) {
 
 function normalizeRaw(s) { return String(s).replace(/\+/g, " ").replace(/\s+/g, " ").trim(); }
 
+// FIX #19 (v2.14): se l'URL è una pagina di consent EU di Google
+// (consent.google.com/m, consent.google.com/ml, ecc.), estrae il vero URL Maps
+// dal parametro `continue=`. Altrimenti ritorna l'URL originale invariato.
+// Si applica all'URL incollato dall'utente PRIMA di qualsiasi parser.
+function unwrapConsentUrl(urlStr) {
+  try {
+    const u = new URL(urlStr);
+    if (u.hostname === "consent.google.com" || u.hostname === "consent.youtube.com") {
+      const cont = u.searchParams.get("continue");
+      if (cont) return cont; // già URL-decoded da searchParams.get()
+    }
+  } catch {}
+  return urlStr;
+}
+
+// FIX #20 (v2.14): parser per i link Apple Maps (maps.apple.com/?...).
+// Formati supportati:
+//   Place:
+//     ?ll=lat,lon              → coordinate dirette
+//     ?ll=lat,lon&q=Nome       → coordinate + label
+//     ?q=Nome|q=lat,lon        → ricerca testuale o coordinate
+//     ?address=Indirizzo       → indirizzo testuale
+//   Directions:
+//     ?saddr=...&daddr=...&dirflg=d  → origin/destination (waypoints via "+to:")
+// dirflg → travelmode: d=driving, w=walking, r=cycling/transit
+function parseAppleMaps(urlStr) {
+  let url;
+  try { url = new URL(urlStr); } catch { throw new Error("URL Apple Maps non valido"); }
+  if (url.hostname !== "maps.apple.com") throw new Error("Non è un link Apple Maps");
+
+  const sp = url.searchParams;
+
+  // 1) DIRECTIONS — se ci sono sia saddr che daddr
+  const saddrA = sp.get("saddr");
+  const daddrA = sp.get("daddr");
+  if (saddrA && daddrA) {
+    const places = [{ raw: normalizeRaw(saddrA) }];
+    // daddr può contenere waypoints separati da " to:" (Apple) o "+to:" (vecchio)
+    const segs = String(daddrA).split(/\s+to:|\+to:/);
+    for (const seg of segs) places.push({ raw: normalizeRaw(seg) });
+
+    const flag = sp.get("dirflg");
+    let travelMode = null;
+    if (flag === "d") travelMode = "driving";
+    else if (flag === "w") travelMode = "walking";
+    else if (flag === "r") travelMode = "transit"; // non supportato da OSRM
+
+    return { kind: "directions", places, travelMode };
+  }
+
+  // 2) PLACE — coordinate esplicite via ll=
+  const ll = sp.get("ll");
+  if (ll && /^-?\d+(\.\d+)?,-?\d+(\.\d+)?$/.test(ll.trim())) {
+    const name = sp.get("q") ? normalizeRaw(sp.get("q")) : null;
+    return { kind: "place", place: { raw: ll.trim(), name } };
+  }
+
+  // 3) PLACE — ?address=Indirizzo
+  const address = sp.get("address");
+  if (address) {
+    return { kind: "place", place: { raw: normalizeRaw(address) } };
+  }
+
+  // 4) PLACE — ?q=Nome oppure ?q=lat,lon
+  const qA = sp.get("q");
+  if (qA) {
+    return { kind: "place", place: { raw: normalizeRaw(qA) } };
+  }
+
+  throw new Error("Link Apple Maps senza posizione riconoscibile");
+}
+
 function parseGoogleMapsDirections(urlStr) {
   let url; try { url = new URL(urlStr); } catch { throw new Error("URL non valido"); }
   const places = []; let travelMode = null;
@@ -430,6 +542,26 @@ function parseGoogleMapsDirections(urlStr) {
     travelMode = sp.get("travelmode");
     return { places, travelMode };
   }
+
+  // FIX #18 (v2.14): formato LEGACY ?saddr=...&daddr=...&dirflg=...
+  // Usato dagli URL Google Maps espansi dai short link iPhone.
+  // daddr può contenere waypoints separati da " to:" (es. "BO to:Modena").
+  const saddrL = sp.get("saddr");
+  const daddrL = sp.get("daddr");
+  if (saddrL && daddrL) {
+    places.push({ raw: normalizeRaw(saddrL) });
+    const segs = String(daddrL).split(/\s+to:|\+to:/);
+    for (const seg of segs) places.push({ raw: normalizeRaw(seg) });
+
+    const flag = sp.get("dirflg");
+    if (flag === "d") travelMode = "driving";
+    else if (flag === "w") travelMode = "walking";
+    else if (flag === "b") travelMode = "bicycling";
+    else if (flag === "r") travelMode = "transit"; // non supportato da OSRM
+
+    return { places, travelMode };
+  }
+
   throw new Error("Questo non sembra un link di Indicazioni Google Maps");
 }
 
