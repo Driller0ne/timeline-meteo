@@ -3,6 +3,20 @@ import React, { useMemo, useState } from "react";
 /**
  * App: Timeline Meteo sul Percorso
  *
+ * v2.12 — Blocco 3 (geocoding POI):
+ *  13. Cascata geocoder a 3 stadi: Open-Meteo → Nominatim → Photon (Komoot)
+ *      per supportare meglio POI commerciali (es. "McDonald's Sassuolo")
+ *      e tollerare i typo.
+ *  14. Nominatim ora con bias Italia (countrycodes=it), limit=3, addressdetails=1.
+ *      Nota: User-Agent è un "forbidden header" nel browser e non può essere
+ *      impostato via fetch; l'identificazione avviene tramite Referer automatico
+ *      e Accept-Language. Per uso massivo servirebbe un proxy serverless.
+ *  15. Fallimento parziale: se una tappa INTERMEDIA è introvabile, viene
+ *      saltata e mostrato un avviso giallo; la rotta si calcola con le altre.
+ *      Origine e destinazione restano bloccanti (non possono essere saltate
+ *      perché ridefinirebbero la rotta).
+ *  16. Messaggi di errore più chiari quando origin/destination falliscono.
+ *
  * v2.11 — Blocco 1 (pulizia):
  *   7. setLoading(true) spostato PRIMA del geocoding nel ramo "directions"
  *      (era dopo: l'utente non vedeva "Calcolo…" durante la risoluzione coordinate)
@@ -113,7 +127,46 @@ export default function App() {
       // FIX #7 (v2.11): setLoading(true) PRIMA del geocoding,
       // così il bottone mostra "Calcolo…" anche durante ensureCoords()
       setLoading(true);
-      const places = await Promise.all(parsedNow.places.map((p) => ensureCoords(p)));
+
+      // FIX #15 (v2.12): geocoding "tollerante al fallimento parziale".
+      // Per ciascuna tappa proviamo a risolvere le coordinate; se la tappa
+      // intermedia non si trova, la saltiamo e mostriamo un avviso.
+      // L'origine (prima tappa) e la destinazione (ultima) restano bloccanti.
+      const geocodeResults = await Promise.all(
+        parsedNow.places.map(async (p, idx) => {
+          try {
+            const resolved = await ensureCoords(p);
+            return { ok: true, idx, place: resolved, originalRaw: p.raw };
+          } catch (err) {
+            return { ok: false, idx, originalRaw: p.raw, error: err?.message || String(err) };
+          }
+        })
+      );
+
+      const firstResult = geocodeResults[0];
+      const lastResult = geocodeResults[geocodeResults.length - 1];
+
+      if (!firstResult.ok) {
+        throw new Error(
+          `Impossibile trovare le coordinate dell'origine: "${firstResult.originalRaw}". ` +
+          `Prova a usare le coordinate (es. 44.65,11.18) o a copiare un link diretto di Google Maps di quella tappa.`
+        );
+      }
+      if (!lastResult.ok) {
+        throw new Error(
+          `Impossibile trovare le coordinate della destinazione: "${lastResult.originalRaw}". ` +
+          `Prova a usare le coordinate (es. 44.65,11.18) o a copiare un link diretto di Google Maps di quella tappa.`
+        );
+      }
+
+      // Tappe valide → al router; tappe scartate → in lista per l'avviso UI
+      const places = geocodeResults.filter((r) => r.ok).map((r) => r.place);
+      const skipped = geocodeResults.filter((r) => !r.ok).map((r) => r.originalRaw);
+      const warning = skipped.length > 0
+        ? (skipped.length === 1
+            ? `Tappa intermedia saltata: "${skipped[0]}" (coordinate non trovate). La rotta è stata calcolata senza questa tappa.`
+            : `Tappe intermedie saltate: ${skipped.map((s) => `"${s}"`).join(", ")} (coordinate non trovate). La rotta è stata calcolata senza queste tappe.`)
+        : null;
 
       // Routing OSRM (alias: "motorcycle" => driving)
       const osrmProfile = travelMode === "motorcycle" ? "driving" : travelMode;
@@ -197,6 +250,7 @@ export default function App() {
         summary: { distance: route.distance, duration: route.duration, legs: route.legs.length },
         schedule: enriched,
         profile,
+        warning,
       });
     } catch (e) {
       setError((e && e.message) || String(e));
@@ -426,9 +480,10 @@ function looksLikeLatLon(raw) {
   return Number.isFinite(lat) && Number.isFinite(lon) && Math.abs(lat) <= 90 && Math.abs(lon) <= 180;
 }
 
-async function geocodeOpenMeteo(q) {
-  const queryName = normalizeRaw(String(q)); // FIX #4: rinominato da "name" a "queryName" per evitare shadowing
-  // 1) Open‑Meteo
+async function geocode(q) {
+  const queryName = normalizeRaw(String(q));
+
+  // 1) Open-Meteo Geocoding (rapido, ottimo per città italiane e località note)
   try {
     const u = new URL("https://geocoding-api.open-meteo.com/v1/search");
     u.searchParams.set("name", queryName);
@@ -439,15 +494,28 @@ async function geocodeOpenMeteo(q) {
     if (r.ok) {
       const j = await r.json();
       const hit = j.results?.[0];
-      if (hit) return { name: hit.name, lat: hit.latitude, lon: hit.longitude };
+      if (hit) {
+        return {
+          name: hit.name,
+          prov: null,
+          lat: hit.latitude,
+          lon: hit.longitude,
+          source: "open-meteo",
+        };
+      }
     }
   } catch {}
-  // 2) Nominatim (fallback)
+
+  // 2) Nominatim (OpenStreetMap) — bravo con POI commerciali, indirizzi
+  //    Bias: solo risultati in Italia (countrycodes=it).
+  //    Se serve estero, l'utente può incollare coordinate o link Google Maps.
   try {
     const u = new URL("https://nominatim.openstreetmap.org/search");
     u.searchParams.set("format", "jsonv2");
-    u.searchParams.set("limit", "1");
+    u.searchParams.set("limit", "3");
     u.searchParams.set("q", queryName);
+    u.searchParams.set("countrycodes", "it");
+    u.searchParams.set("addressdetails", "1");
     const r = await fetch(u.toString(), { headers: { "Accept-Language": "it" } });
     if (r.ok) {
       const j = await r.json();
@@ -455,14 +523,52 @@ async function geocodeOpenMeteo(q) {
       if (hit) {
         const lat = parseFloat(hit.lat);
         const lon = parseFloat(hit.lon);
-        // Reverse per ottenere Località + Provincia (sigla)
-        const info = await reverseName(lat, lon);
-        const resolvedName = info?.name || hit.name || hit.display_name; // FIX #4: era "const name" (shadowing)
-        const prov = info?.prov || null;
-        return { name: resolvedName, prov, lat, lon };
+        // Estrae city + sigla provincia direttamente dall'hit (ha addressdetails)
+        const info = extractCityProv(hit);
+        const resolvedName = info?.name || hit.display_name?.split(",")[0]?.trim() || queryName;
+        return {
+          name: resolvedName,
+          prov: info?.prov || null,
+          lat,
+          lon,
+          source: "nominatim",
+        };
       }
     }
   } catch {}
+
+  // 3) Photon (Komoot) — fallback per POI difficili e tolleranza ai typo.
+  //    Bias geografico verso l'Italia (lat/lon = centro penisola).
+  try {
+    const u = new URL("https://photon.komoot.io/api/");
+    u.searchParams.set("q", queryName);
+    u.searchParams.set("lang", "it");
+    u.searchParams.set("limit", "3");
+    u.searchParams.set("lat", "42.5");
+    u.searchParams.set("lon", "12.5");
+    const r = await fetch(u.toString());
+    if (r.ok) {
+      const j = await r.json();
+      // Photon ritorna GeoJSON FeatureCollection
+      const features = j?.features || [];
+      // Preferisci un risultato in Italia se presente
+      const itHit = features.find((f) => f?.properties?.countrycode === "IT");
+      const hit = itHit || features[0];
+      if (hit) {
+        const [lon, lat] = hit.geometry.coordinates;
+        const props = hit.properties || {};
+        const resolvedName = props.name || props.city || props.street || queryName;
+        return {
+          name: resolvedName,
+          prov: null,
+          lat,
+          lon,
+          source: "photon",
+        };
+      }
+    }
+  } catch {}
+
   return null;
 }
 
@@ -472,7 +578,7 @@ async function ensureCoords(place) {
     const [latStr, lonStr] = raw.split(",").map((s) => s.trim());
     return { ...place, lat: parseFloat(latStr), lon: parseFloat(lonStr) };
   }
-  const g = await geocodeOpenMeteo(raw);
+  const g = await geocode(raw);
   if (!g) throw new Error(`Geocoding fallito per: ${raw}`);
   return { ...place, name: g.name, prov: g.prov ?? place.prov ?? null, lat: g.lat, lon: g.lon };
 }
@@ -594,6 +700,7 @@ function formatPlaceLabel(p) { if (p?.name) return p.name; if (typeof p?.lat ===
 
 // ——— UI risultato ———
 // FIX #3: gestisce il caso posizione singola (distance:0, duration:0, singlePlace:true)
+// FIX #15 (v2.12): mostra avviso giallo se ci sono tappe intermedie saltate
 function ResultView({ data }) {
   const isSinglePlace = data.summary.singlePlace === true;
   const totalKm = (data.summary.distance / 1000).toFixed(1);
@@ -601,6 +708,11 @@ function ResultView({ data }) {
 
   return (
     <div className="mt-6">
+      {data.warning && (
+        <div className="mb-4 rounded-xl bg-amber-900/30 border border-amber-700/50 p-3 text-sm text-amber-200">
+          ⚠️ {data.warning}
+        </div>
+      )}
       <div className="bg-neutral-800 rounded-2xl shadow p-4 mb-4">
         <h2 className="text-xl font-semibold text-orange-500">Riepilogo</h2>
         <p className="text-sm text-gray-100 mt-1">
