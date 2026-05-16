@@ -2,6 +2,18 @@ import React, { useMemo, useState } from "react";
 
 /**
  * App: Timeline Meteo sul Percorso
+ *
+ * v2.11 — Blocco 1 (pulizia):
+ *   7. setLoading(true) spostato PRIMA del geocoding nel ramo "directions"
+ *      (era dopo: l'utente non vedeva "Calcolo…" durante la risoluzione coordinate)
+ *   8. Rimosso setLoading(false) inutile nel ramo "short link non espandibile"
+ *      (il finally lo gestisce già)
+ *   9. Rimosso refuso "rafa": "RA" da toProvCode (Ravenna è già presente)
+ *  10. Rimossa funzione TestsPanel (mai utilizzata in render)
+ *  11. Rimossa funzione DevTests (mai utilizzata in render)
+ *  12. Aggiornato testo etichette/header: l'app accetta sia Indicazioni
+ *      che Posizione singola, non solo Indicazioni
+ *
  * v2.10 — bug fixes rispetto a v2.8/v2.9:
  *   1. parseGoogleMapsPlace spostata FUORI da App (era dentro per errore)
  *   2. setLoading(true) aggiunto nel ramo "place" (era mancante)
@@ -52,7 +64,6 @@ export default function App() {
         if (exp) urlToUse = exp;
         else {
           setError("Questo è un link corto di Google Maps che non posso espandere automaticamente. Apri il link, tocca \"Apri in Google Maps\" e copia l'URL completo.");
-          setLoading(false);
           return;
         }
       }
@@ -98,7 +109,10 @@ export default function App() {
         return;
       }
 
-      // === Caso INDICAZIONI: flusso originale invariato ===
+      // === Caso INDICAZIONI ===
+      // FIX #7 (v2.11): setLoading(true) PRIMA del geocoding,
+      // così il bottone mostra "Calcolo…" anche durante ensureCoords()
+      setLoading(true);
       const places = await Promise.all(parsedNow.places.map((p) => ensureCoords(p)));
 
       // Routing OSRM (alias: "motorcycle" => driving)
@@ -106,7 +120,6 @@ export default function App() {
       const coordsPath = places.map((p) => `${p.lon},${p.lat}`).join(";");
       const osrmUrl = `https://router.project-osrm.org/route/v1/${osrmProfile}/${coordsPath}?overview=full&geometries=geojson&steps=false&annotations=distance,duration`;
 
-      setLoading(true);
       const routeResp = await fetch(osrmUrl);
       if (!routeResp.ok) throw new Error("Errore routing OSRM");
       const routeJson = await routeResp.json();
@@ -207,12 +220,15 @@ export default function App() {
               SUL PERCORSO
             </span>
           </h1>
-          <p className="text-sm text-gray-600 mt-2">Incolla un link di <strong>Indicazioni Google Maps</strong>, scegli data/ora e (opzionale) checkpoint ogni X km.</p>
+          <p className="text-sm text-gray-600 mt-2">
+            Incolla un link di <strong>Google Maps</strong> (Indicazioni o Posizione singola),
+            scegli data/ora e (opzionale) checkpoint ogni X km.
+          </p>
         </header>
 
         <div className="bg-neutral-800 rounded-2xl shadow p-4 space-y-4">
           <label className="block">
-            <span className="text-sm font-medium">Link Google Maps – Indicazioni</span>
+            <span className="text-sm font-medium">Link Google Maps</span>
             <input
               className="mt-1 w-full rounded-xl border border-gray-600 bg-neutral-700 text-gray-100 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-orange-500"
               placeholder="https://www.google.com/maps/dir/?api=1&origin=...&destination=..."
@@ -279,35 +295,7 @@ export default function App() {
         </div>
 
         {result && <ResultView data={result} />}
-
-        {/* Pannello test (dev) */}
-
       </div>
-    </div>
-  );
-}
-
-
-// === Tests Panel ===
-function TestsPanel({ onPick }) {
-  const examples = [
-    { label: "Milano → Torino (auto)", url: "https://www.google.com/maps/dir/?api=1&origin=Milano&destination=Torino&travelmode=driving" },
-    { label: "Roma → Napoli (auto, via Cassino)", url: "https://www.google.com/maps/dir/?api=1&origin=Roma&destination=Napoli&waypoints=Cassino&travelmode=driving" },
-    { label: "Bologna → Firenze (bici)", url: "https://www.google.com/maps/dir/?api=1&origin=Bologna&destination=Firenze&travelmode=cycling" },
-    { label: "Coord: Milano → Torino", url: "https://www.google.com/maps/dir/?api=1&origin=45.4642,9.1900&destination=45.0703,7.6869&travelmode=driving" },
-  ];
-  return (
-    <div className="mt-6 bg-white border rounded p-3 space-y-2">
-      <h3 className="font-semibold">Esempi rapidi</h3>
-      {examples.map((ex, i) => (
-        <button
-          key={i}
-          className="block text-left underline text-blue-600 hover:text-blue-800"
-          onClick={() => onPick(ex.url)}
-        >
-          {ex.label}
-        </button>
-      ))}
     </div>
   );
 }
@@ -522,6 +510,7 @@ function toProvCode(name) {
   if (!name) return null;
   const n = String(name).toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
 
+  // FIX #9 (v2.11): rimosso refuso "rafa": "RA" (Ravenna è già mappata correttamente)
   const map = {
     "agrigento": "AG", "alessandria": "AL", "ancona": "AN", "aosta": "AO", "aosta valley": "AO",
     "arezzo": "AR", "ascoli piceno": "AP", "asti": "AT", "avellino": "AV",
@@ -540,7 +529,7 @@ function toProvCode(name) {
     "matera": "MT", "messina": "ME", "milano": "MI", "modena": "MO", "monza e della brianza": "MB",
     "napoli": "NA", "novara": "NO", "nuoro": "NU", "oristano": "OR", "padova": "PD", "palermo": "PA",
     "parma": "PR", "pavia": "PV", "perugia": "PG", "pescara": "PE", "piacenza": "PC", "pisa": "PI",
-    "pistoia": "PT", "pordenone": "PN", "potenza": "PZ", "prato": "PO", "rafa": "RA",
+    "pistoia": "PT", "pordenone": "PN", "potenza": "PZ", "prato": "PO",
     "ragusa": "RG", "ravenna": "RA", "reggio calabria": "RC", "reggio nell'emilia": "RE", "reggio emilia": "RE",
     "rieti": "RI", "rimini": "RN", "roma": "RM", "rome": "RM", "rovigo": "RO",
     "salerno": "SA", "sassari": "SS", "savona": "SV", "siena": "SI", "siracusa": "SR", "sondrio": "SO",
@@ -650,9 +639,6 @@ function ResultRow({ wp, idx, total }) {
   return (
     <div className="relative bg-neutral-800 rounded-2xl shadow px-4 py-3 overflow-hidden">
       {/*
-        FIX #5: rimosso il commento CSS "/* fr => ... *\/" che era dentro la stringa className
-        e veniva inviato al browser come classe non valida.
-
         Desktop (>= md): 6 colonne — Ora | Km | Località+Meteo | Temp | Icona | Pioggia+Vento
         Mobile  (< md):  4 blocchi  — [Ora/Km] [Località/Descrizione] [Temp/Vento] [Icona/Pioggia]
       */}
@@ -721,66 +707,3 @@ function weatherCodeToIcon(code) {
 }
 
 function weatherCodeToText(code) { const map = { 0: "Sereno", 1: "Prevalentemente sereno", 2: "Parzialmente nuvoloso", 3: "Coperto", 45: "Nebbia", 48: "Nebbia con brina", 51: "Pioviggine leggera", 53: "Pioviggine", 55: "Pioviggine intensa", 56: "Pioggia gelata leggera", 57: "Pioggia gelata", 61: "Pioggia debole", 63: "Pioggia", 65: "Pioggia forte", 66: "Rovescio gelato leggero", 67: "Rovescio gelato", 71: "Neve debole", 73: "Neve", 75: "Neve forte", 77: "Granelli di neve", 80: "Rovesci leggeri", 81: "Rovesci", 82: "Rovesci intensi", 85: "Rovesci di neve leggeri", 86: "Rovesci di neve intensi", 95: "Temporale", 96: "Temporale con grandine", 99: "Temporale con grandine forte" }; return map?.[code] ?? `Codice meteo ${code}`; }
-
-// ——— Dev tests (semplici, senza rete) ———
-function DevTests() {
-  const tests = useMemo(() => {
-    const cases = [];
-    // isShortGmaps
-    cases.push({ name: 'isShortGmaps maps.app.goo.gl', pass: isShortGmaps('https://maps.app.goo.gl/abc') === true });
-    cases.push({ name: 'isShortGmaps goo.gl/maps', pass: isShortGmaps('https://goo.gl/maps/abcd') === true });
-    cases.push({ name: 'isShortGmaps google.com/maps (no short)', pass: isShortGmaps('https://www.google.com/maps/dir/?api=1&origin=Milano&destination=Torino') === false });
-
-    // parseGoogleMapsDirections api=1
-    try {
-      const p = parseGoogleMapsDirections('https://www.google.com/maps/dir/?api=1&origin=Milano&destination=Torino&travelmode=driving');
-      cases.push({ name: 'parse api=1 two places', pass: Array.isArray(p.places) && p.places.length >= 2 });
-    } catch (e) {
-      cases.push({ name: 'parse api=1 two places', pass: false, info: String(e?.message || e) });
-    }
-
-    // parse /maps/dir/
-    try {
-      const p2 = parseGoogleMapsDirections('https://www.google.com/maps/dir/Milano/Torino');
-      cases.push({ name: 'parse /maps/dir two places', pass: Array.isArray(p2.places) && p2.places.length >= 2 });
-    } catch (e) {
-      cases.push({ name: 'parse /maps/dir two places', pass: false, info: String(e?.message || e) });
-    }
-
-    // parseGoogleMapsPlace: /maps/place/ con @coords → raw deve essere "lat,lon" (FIX #6)
-    try {
-      const p3 = parseGoogleMapsPlace('https://www.google.com/maps/place/Toppy+S.r.l./@44.4821,11.1234,17z');
-      const rawIsCoords = p3?.place?.raw === "44.4821,11.1234";
-      const namePreserved = p3?.place?.name === "Toppy S.r.l.";
-      cases.push({ name: 'parsePlace /maps/place/ con @coords: raw=lat,lon', pass: rawIsCoords });
-      cases.push({ name: 'parsePlace /maps/place/ con @coords: name preservato', pass: namePreserved });
-    } catch (e) {
-      cases.push({ name: 'parsePlace /maps/place/ con @coords: raw=lat,lon', pass: false, info: String(e?.message || e) });
-    }
-
-    // parseGoogleMapsPlace: ?q=
-    try {
-      const p4 = parseGoogleMapsPlace('https://www.google.com/maps?q=45.4654,9.1859');
-      cases.push({ name: 'parsePlace ?q=lat,lon', pass: !!p4?.place?.raw });
-    } catch (e) {
-      cases.push({ name: 'parsePlace ?q=lat,lon', pass: false, info: String(e?.message || e) });
-    }
-
-    return cases;
-  }, []);
-
-  const passed = tests.filter(t => t.pass).length;
-  return (
-    <div className="mt-8 bg-white rounded-2xl border p-4">
-      <h3 className="font-semibold">Pannello test (dev)</h3>
-      <p className="text-sm text-gray-600">{passed}/{tests.length} test passati</p>
-      <ul className="mt-2 list-disc pl-6 text-sm">
-        {tests.map((t, i) => (
-          <li key={i} className={t.pass ? 'text-green-700' : 'text-red-700'}>
-            {t.name} {t.pass ? '✓' : '✗'} {t.info ? `— ${t.info}` : ''}
-          </li>
-        ))}
-      </ul>
-    </div>
-  );
-}
