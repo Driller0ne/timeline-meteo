@@ -2,14 +2,13 @@
 //
 // Vercel serverless function: espande short link di Google Maps in URL completi.
 //
-// v2.14 — Blocco 4:
-//  - Gestione redirect via consent.google.com (caso EU): estrae il parametro
-//    `continue=` per ottenere l'URL Maps reale.
-//  - Aggiunto goo.gle alla whitelist short link.
-//  - User-Agent realistico (in alcuni casi cambia il comportamento del redirect).
-//  - Timeout 8s su ogni fetch (AbortController) per evitare function "appese".
-//  - Loop redirect alzato da 5 a 8 (catene EU possono essere lunghe).
-//  - Se il `continue=` punta a un nuovo short link, l'iterazione prosegue.
+// v2.14b — Blocco 4, follow-up:
+//  - Strategia ibrida: prima tenta redirect HTTP classico, poi se non c'è
+//    Location header (Google a volte restituisce HTML con redirect JS),
+//    legge il body HTML e cerca l'URL Maps in vari pattern (meta refresh,
+//    canonical, og:url, script).
+//  - Headers super-realistici (Sec-Fetch-*, Upgrade-Insecure-Requests).
+//  - Debug info nel response in caso di fallimento, per troubleshooting rapido.
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -18,13 +17,39 @@ export default async function handler(req, res) {
 
   const SHORT_HOSTS = new Set(['maps.app.goo.gl', 'goo.gl', 'goo.gle']);
   const CONSENT_HOSTS = new Set(['consent.google.com', 'consent.youtube.com']);
-  const FETCH_TIMEOUT_MS = 8000;
-  const MAX_HOPS = 8;
-  // UA realistico: alcuni redirect Google variano in base allo User-Agent.
+  const FETCH_TIMEOUT_MS = 9000;
+  const MAX_HOPS = 5;
+  const MAX_HTML_BYTES = 80 * 1024; // leggiamo al massimo 80KB del body HTML
+
+  // UA realistico (Safari macOS recente).
   const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) ' +
              'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15';
 
-  // Estrae l'URL reale da un URL consent.google.com (parametro `continue`).
+  // Headers tipici di un browser reale che visita un link.
+  const BROWSER_HEADERS = {
+    'User-Agent': UA,
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Accept-Language': 'it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Upgrade-Insecure-Requests': '1',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-User': '?1',
+  };
+
+  const debug = []; // log dei hop per troubleshooting
+
+  function isMapsLikeUrl(s) {
+    if (!s) return false;
+    try {
+      const parsed = new URL(s);
+      const h = parsed.hostname;
+      // Accetta www.google.com, google.com, maps.google.com, google.<tld>/maps
+      return /(^|\.)google\.[a-z.]+$/i.test(h) && /\/maps(\/|$|\?)/.test(parsed.pathname + (parsed.search || ''));
+    } catch { return false; }
+  }
+
   function extractFromConsent(consentUrlStr) {
     try {
       const cu = new URL(consentUrlStr);
@@ -35,7 +60,47 @@ export default async function handler(req, res) {
     return null;
   }
 
-  // Fetch con timeout via AbortController.
+  // Decodifica entità HTML comuni
+  function htmlDecode(s) {
+    return String(s)
+      .replace(/&amp;/g, '&')
+      .replace(/&#x2F;/gi, '/')
+      .replace(/&#47;/g, '/')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>');
+  }
+
+  // Cerca un URL Google Maps in un body HTML, provando vari pattern.
+  function extractMapsUrlFromHtml(html) {
+    if (!html) return null;
+    const patterns = [
+      // <meta http-equiv="refresh" content="0;url=...">
+      /<meta\s+http-equiv=["']?refresh["']?[^>]*content=["'][^"']*?url=([^"'>\s]+)/i,
+      // <link rel="canonical" href="...">
+      /<link\s+rel=["']canonical["']\s+href=["']([^"']+)["']/i,
+      // <meta property="og:url" content="...">
+      /<meta\s+(?:property|name)=["']og:url["']\s+content=["']([^"']+)["']/i,
+      // window.location.replace("...") oppure window.location = "..."
+      /window\.location(?:\.href|\.replace)?\s*[=(]\s*["']([^"']+)["']/i,
+      // location.replace("...") generico
+      /location\.replace\(["']([^"']+)["']\)/i,
+      // Anchor verso google.com/maps
+      /href=["'](https?:\/\/(?:www\.|maps\.)?google\.[a-z.]+\/maps[^"']*)["']/i,
+      // URL in JSON inline o variabili JS
+      /["'](https?:\/\/(?:www\.|maps\.)?google\.[a-z.]+\/maps\/[^"'\s]+)["']/i,
+    ];
+    for (const re of patterns) {
+      const m = html.match(re);
+      if (m && m[1]) {
+        const url = htmlDecode(m[1]);
+        if (isMapsLikeUrl(url)) return url;
+      }
+    }
+    return null;
+  }
+
   async function fetchWithTimeout(target, opts = {}) {
     const ctrl = new AbortController();
     const tid = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
@@ -43,6 +108,30 @@ export default async function handler(req, res) {
       return await fetch(target, { ...opts, signal: ctrl.signal });
     } finally {
       clearTimeout(tid);
+    }
+  }
+
+  // Legge body HTML limitando i byte letti
+  async function readBodyLimited(response, maxBytes) {
+    try {
+      const reader = response.body?.getReader?.();
+      if (!reader) {
+        const txt = await response.text();
+        return txt.slice(0, maxBytes);
+      }
+      const decoder = new TextDecoder('utf-8', { fatal: false });
+      let read = 0;
+      let out = '';
+      while (read < maxBytes) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        read += value.byteLength;
+        out += decoder.decode(value, { stream: true });
+      }
+      try { await reader.cancel(); } catch {}
+      return out;
+    } catch {
+      return '';
     }
   }
 
@@ -57,94 +146,136 @@ export default async function handler(req, res) {
       return res.status(400).json({ ok: false, error: 'Host not allowed' });
     }
 
-    // Caso speciale: link con parametro ?link= contiene direttamente l'URL espanso.
     const embedded = url.searchParams.get('link');
     if (embedded) {
-      return res.status(200).json({ ok: true, url: decodeURIComponent(embedded) });
+      return res.status(200).json({ ok: true, url: decodeURIComponent(embedded), via: 'embedded-link' });
     }
 
     let current = url.toString();
 
     for (let i = 0; i < MAX_HOPS; i++) {
+      const hopInfo = { i, url: current };
+
+      // STAGE 1: prova con redirect manual (vede Location header)
       let r;
       try {
         r = await fetchWithTimeout(current, {
           redirect: 'manual',
-          headers: {
-            'User-Agent': UA,
-            'Accept-Language': 'it-IT,it;q=0.9,en;q=0.8',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          },
+          headers: BROWSER_HEADERS,
         });
       } catch (fetchErr) {
+        hopInfo.error = `manual fetch failed: ${fetchErr?.message || fetchErr}`;
+        debug.push(hopInfo);
         return res.status(504).json({
           ok: false,
-          error: `Fetch failed/timeout at hop ${i + 1}: ${fetchErr?.message || fetchErr}`,
+          error: `Fetch timeout/failed at hop ${i + 1}`,
+          debug,
         });
       }
 
+      hopInfo.manualStatus = r.status;
       const loc = r.headers.get('location');
-      const finalUrl = r.url;
+      hopInfo.location = loc;
 
-      // CASO 1: redirect HTTP esplicito (Location header)
       if (loc) {
+        // Redirect HTTP classico
         try {
           current = new URL(loc, current).toString();
         } catch {
-          return res.status(502).json({ ok: false, error: 'Invalid redirect URL' });
+          debug.push(hopInfo);
+          return res.status(502).json({ ok: false, error: 'Invalid redirect URL', debug });
         }
         const host = (() => { try { return new URL(current).hostname; } catch { return ''; } })();
+        hopInfo.nextHost = host;
+        debug.push(hopInfo);
 
-        // Arriviamo su consent.google.com? Estraiamo il continue=
         if (CONSENT_HOSTS.has(host)) {
           const real = extractFromConsent(current);
           if (real) {
             const realHost = (() => { try { return new URL(real).hostname; } catch { return ''; } })();
-            // Se continue= è a sua volta short, prosegui il loop con quello.
             if (SHORT_HOSTS.has(realHost)) {
               current = real;
               continue;
             }
-            // Altrimenti è già un URL Maps "lungo": ritornalo.
-            return res.status(200).json({ ok: true, url: real });
+            return res.status(200).json({ ok: true, url: real, via: 'consent-continue', debug });
           }
-          // consent.google.com senza continue: impossibile risolvere.
           return res.status(502).json({
             ok: false,
             error: 'Stuck on consent.google.com without continue param',
+            debug,
           });
         }
 
-        // Host non-short e non-consent: abbiamo finito.
         if (!SHORT_HOSTS.has(host)) {
-          return res.status(200).json({ ok: true, url: current });
+          return res.status(200).json({ ok: true, url: current, via: 'http-redirect', debug });
         }
-        // Ancora short: continua l'iterazione.
+        // Ancora short → continua
         continue;
       }
 
-      // CASO 2: nessun Location, ma fetch ha riportato un finalUrl diverso
-      // (può capitare con redirect 'follow' o cache).
-      if (finalUrl && finalUrl !== current) {
-        const fHost = (() => { try { return new URL(finalUrl).hostname; } catch { return ''; } })();
+      // STAGE 2: nessun Location. Forse pagina HTML con redirect JS.
+      // Rifacciamo la fetch con redirect:'follow' per leggere il body finale.
+      let r2;
+      try {
+        r2 = await fetchWithTimeout(current, {
+          redirect: 'follow',
+          headers: BROWSER_HEADERS,
+        });
+      } catch (fetchErr) {
+        hopInfo.error = `follow fetch failed: ${fetchErr?.message || fetchErr}`;
+        debug.push(hopInfo);
+        return res.status(504).json({
+          ok: false,
+          error: `Body fetch failed at hop ${i + 1}`,
+          debug,
+        });
+      }
+
+      hopInfo.followStatus = r2.status;
+      hopInfo.followFinalUrl = r2.url;
+
+      // Se redirect:'follow' ci ha portato a un URL non-short, ottimo
+      if (r2.url && r2.url !== current) {
+        const fHost = (() => { try { return new URL(r2.url).hostname; } catch { return ''; } })();
         if (CONSENT_HOSTS.has(fHost)) {
-          const real = extractFromConsent(finalUrl);
-          if (real) return res.status(200).json({ ok: true, url: real });
+          const real = extractFromConsent(r2.url);
+          if (real) {
+            debug.push(hopInfo);
+            return res.status(200).json({ ok: true, url: real, via: 'follow-consent', debug });
+          }
         }
         if (!SHORT_HOSTS.has(fHost)) {
-          return res.status(200).json({ ok: true, url: finalUrl });
+          debug.push(hopInfo);
+          return res.status(200).json({ ok: true, url: r2.url, via: 'follow-finalUrl', debug });
         }
       }
 
-      // Nessun Location, nessun cambio di URL: fine catena.
+      // Ultima possibilità: parse del body HTML
+      const html = await readBodyLimited(r2, MAX_HTML_BYTES);
+      hopInfo.htmlBytes = html.length;
+      const fromHtml = extractMapsUrlFromHtml(html);
+      hopInfo.fromHtml = fromHtml;
+      debug.push(hopInfo);
+
+      if (fromHtml) {
+        const fhHost = (() => { try { return new URL(fromHtml).hostname; } catch { return ''; } })();
+        if (CONSENT_HOSTS.has(fhHost)) {
+          const real = extractFromConsent(fromHtml);
+          if (real) return res.status(200).json({ ok: true, url: real, via: 'html-consent', debug });
+        }
+        return res.status(200).json({ ok: true, url: fromHtml, via: 'html-extracted', debug });
+      }
+
+      // Nessun progresso possibile
       break;
     }
 
     return res.status(502).json({
       ok: false,
-      error: 'Could not expand (no redirect exposed after ' + MAX_HOPS + ' hops)',
+      error: 'Could not expand (no redirect or HTML pattern found)',
+      debug,
     });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+    return res.status(500).json({ ok: false, error: e?.message || String(e), debug });
   }
 }
