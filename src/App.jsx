@@ -3,6 +3,18 @@ import React, { useMemo, useState } from "react";
 /**
  * App: Timeline Meteo sul Percorso
  *
+ * v2.13 — Blocco 3, follow-up: indirizzi italiani complessi
+ *  17. Strategia "hint progressivi": per ogni tappa proviamo varie versioni
+ *      della query, dalla più completa alla più generica. Esempio:
+ *        "Toppy S.r.l., Via Moretto, 1, 40056 Valsamoggia BO"
+ *          → "Via Moretto, 1, 40056 Valsamoggia BO"   (-1° segmento)
+ *          → "40056 Valsamoggia BO"                   (dal CAP)
+ *          → "Valsamoggia BO"                         (ultimo segmento)
+ *      Per ogni hint applichiamo la cascata Open-Meteo → Nominatim → Photon.
+ *      Quando una query semplificata trova coordinate, il primo segmento
+ *      della query originale (es. "Toppy S.r.l.") viene mantenuto come
+ *      label visiva nella timeline.
+ *
  * v2.12 — Blocco 3 (geocoding POI):
  *  13. Cascata geocoder a 3 stadi: Open-Meteo → Nominatim → Photon (Komoot)
  *      per supportare meglio POI commerciali (es. "McDonald's Sassuolo")
@@ -480,94 +492,151 @@ function looksLikeLatLon(raw) {
   return Number.isFinite(lat) && Number.isFinite(lon) && Math.abs(lat) <= 90 && Math.abs(lon) <= 180;
 }
 
-async function geocode(q) {
-  const queryName = normalizeRaw(String(q));
+// Costruisce una lista di "hint" progressivi a partire da una query.
+// Es: "Toppy S.r.l., Via Moretto, 1, 40056 Valsamoggia BO" →
+//   [
+//     "Toppy S.r.l., Via Moretto, 1, 40056 Valsamoggia BO", // intera
+//     "Via Moretto, 1, 40056 Valsamoggia BO",               // -1° segmento
+//     "40056 Valsamoggia BO",                               // dal CAP
+//   ]
+// Il primo hint è sempre la query originale. Gli altri vengono aggiunti
+// solo se la query contiene virgole (cioè ha più segmenti).
+function buildAddressHints(query) {
+  const hints = [query];
+  const parts = query.split(",").map((s) => s.trim()).filter(Boolean);
+  if (parts.length <= 1) return hints;
 
-  // 1) Open-Meteo Geocoding (rapido, ottimo per città italiane e località note)
+  // Hint: senza il primo segmento (di solito nome azienda / POI)
+  const withoutFirst = parts.slice(1).join(", ");
+  if (withoutFirst && !hints.includes(withoutFirst)) hints.push(withoutFirst);
+
+  // Hint: dal CAP italiano in poi (5 cifre)
+  const capIdx = parts.findIndex((p) => /\b\d{5}\b/.test(p));
+  if (capIdx > 0) {
+    const fromCap = parts.slice(capIdx).join(", ");
+    if (!hints.includes(fromCap)) hints.push(fromCap);
+  }
+
+  // Hint: solo l'ultimo segmento (di solito Comune + sigla provincia)
+  const last = parts[parts.length - 1];
+  if (last && !hints.includes(last)) hints.push(last);
+
+  return hints;
+}
+
+// Provider 1: Open-Meteo Geocoding (rapido, ottimo per città italiane)
+async function _tryOpenMeteo(q) {
   try {
     const u = new URL("https://geocoding-api.open-meteo.com/v1/search");
-    u.searchParams.set("name", queryName);
-    u.searchParams.set("count", "1");
+    u.searchParams.set("name", q);
+    u.searchParams.set("count", "3");
     u.searchParams.set("language", "it");
     u.searchParams.set("format", "json");
     const r = await fetch(u.toString());
-    if (r.ok) {
-      const j = await r.json();
-      const hit = j.results?.[0];
-      if (hit) {
-        return {
-          name: hit.name,
-          prov: null,
-          lat: hit.latitude,
-          lon: hit.longitude,
-          source: "open-meteo",
-        };
-      }
-    }
-  } catch {}
+    if (!r.ok) return null;
+    const j = await r.json();
+    // Preferisci risultati in Italia se presenti
+    const itHit = j.results?.find((h) => h.country_code === "IT");
+    const hit = itHit || j.results?.[0];
+    if (!hit) return null;
+    return {
+      name: hit.name,
+      prov: null,
+      lat: hit.latitude,
+      lon: hit.longitude,
+      source: "open-meteo",
+    };
+  } catch {
+    return null;
+  }
+}
 
-  // 2) Nominatim (OpenStreetMap) — bravo con POI commerciali, indirizzi
-  //    Bias: solo risultati in Italia (countrycodes=it).
-  //    Se serve estero, l'utente può incollare coordinate o link Google Maps.
+// Provider 2: Nominatim (OpenStreetMap) — bravo con POI e indirizzi
+async function _tryNominatim(q) {
   try {
     const u = new URL("https://nominatim.openstreetmap.org/search");
     u.searchParams.set("format", "jsonv2");
     u.searchParams.set("limit", "3");
-    u.searchParams.set("q", queryName);
+    u.searchParams.set("q", q);
     u.searchParams.set("countrycodes", "it");
     u.searchParams.set("addressdetails", "1");
     const r = await fetch(u.toString(), { headers: { "Accept-Language": "it" } });
-    if (r.ok) {
-      const j = await r.json();
-      const hit = j?.[0];
-      if (hit) {
-        const lat = parseFloat(hit.lat);
-        const lon = parseFloat(hit.lon);
-        // Estrae city + sigla provincia direttamente dall'hit (ha addressdetails)
-        const info = extractCityProv(hit);
-        const resolvedName = info?.name || hit.display_name?.split(",")[0]?.trim() || queryName;
-        return {
-          name: resolvedName,
-          prov: info?.prov || null,
-          lat,
-          lon,
-          source: "nominatim",
-        };
-      }
-    }
-  } catch {}
+    if (!r.ok) return null;
+    const j = await r.json();
+    const hit = j?.[0];
+    if (!hit) return null;
+    const lat = parseFloat(hit.lat);
+    const lon = parseFloat(hit.lon);
+    const info = extractCityProv(hit);
+    const resolvedName = info?.name || hit.display_name?.split(",")[0]?.trim() || q;
+    return {
+      name: resolvedName,
+      prov: info?.prov || null,
+      lat,
+      lon,
+      source: "nominatim",
+    };
+  } catch {
+    return null;
+  }
+}
 
-  // 3) Photon (Komoot) — fallback per POI difficili e tolleranza ai typo.
-  //    Bias geografico verso l'Italia (lat/lon = centro penisola).
+// Provider 3: Photon (Komoot) — tollerante ai typo, ottimo come fallback
+async function _tryPhoton(q) {
   try {
     const u = new URL("https://photon.komoot.io/api/");
-    u.searchParams.set("q", queryName);
+    u.searchParams.set("q", q);
     u.searchParams.set("lang", "it");
     u.searchParams.set("limit", "3");
     u.searchParams.set("lat", "42.5");
     u.searchParams.set("lon", "12.5");
     const r = await fetch(u.toString());
-    if (r.ok) {
-      const j = await r.json();
-      // Photon ritorna GeoJSON FeatureCollection
-      const features = j?.features || [];
-      // Preferisci un risultato in Italia se presente
-      const itHit = features.find((f) => f?.properties?.countrycode === "IT");
-      const hit = itHit || features[0];
-      if (hit) {
-        const [lon, lat] = hit.geometry.coordinates;
-        const props = hit.properties || {};
-        const resolvedName = props.name || props.city || props.street || queryName;
-        return {
-          name: resolvedName,
-          prov: null,
-          lat,
-          lon,
-          source: "photon",
-        };
+    if (!r.ok) return null;
+    const j = await r.json();
+    const features = j?.features || [];
+    const itHit = features.find((f) => f?.properties?.countrycode === "IT");
+    const hit = itHit || features[0];
+    if (!hit) return null;
+    const [lon, lat] = hit.geometry.coordinates;
+    const props = hit.properties || {};
+    const resolvedName = props.name || props.city || props.street || q;
+    return {
+      name: resolvedName,
+      prov: null,
+      lat,
+      lon,
+      source: "photon",
+    };
+  } catch {
+    return null;
+  }
+}
+
+// Cascata geocoder: per ogni "hint" (query progressivamente più semplice)
+// prova i 3 provider in ordine. Al primo successo si ferma.
+// Se ha dovuto usare un hint semplificato, conserva il primo segmento della
+// query originale come label visiva (più riconoscibile per l'utente).
+async function geocode(q) {
+  const queryName = normalizeRaw(String(q));
+  const hints = buildAddressHints(queryName);
+
+  for (let i = 0; i < hints.length; i++) {
+    const hint = hints[i];
+    const result =
+      (await _tryOpenMeteo(hint)) ||
+      (await _tryNominatim(hint)) ||
+      (await _tryPhoton(hint));
+
+    if (result) {
+      if (i > 0) {
+        // Query è stata semplificata: usa il primo segmento dell'originale
+        // come label, perché è più riconoscibile per l'utente.
+        const labelFromOriginal = queryName.split(",")[0]?.trim();
+        if (labelFromOriginal) result.name = labelFromOriginal;
       }
+      return result;
     }
-  } catch {}
+  }
 
   return null;
 }
