@@ -3,6 +3,19 @@ import React, { useMemo, useState } from "react";
 /**
  * App: Timeline Meteo sul Percorso
  *
+ * v2.15 — Blocco 4 follow-up: supporto Waze
+ *  22. Aggiunto parser per i link Waze (waze.com / www.waze.com).
+ *      Formati supportati:
+ *        ?ll=lat,lon                → place singolo
+ *        ?q=Nome                    → place per nome (geocodato)
+ *        ?to=ll.lat,lon &from=ll... → directions
+ *        ?to=place.Nome             → directions con luogo testuale
+ *      Travel mode: sempre "driving" (Waze è solo per auto).
+ *      No waypoint multipli (Waze non li supporta nei link).
+ *  23. Link "Share Drive" Waze (?a=share_drive) sono live tracking di
+ *      un viaggio in tempo reale, NON un percorso pianificato. Vengono
+ *      rifiutati con messaggio di errore dedicato.
+ *
  * v2.14 — Blocco 4 (client-side, link iPhone/Apple/consent EU):
  *  18. Aggiunto parser per il formato legacy `?saddr=...&daddr=...&dirflg=...`
  *      usato dagli URL Google Maps espansi da short link iPhone.
@@ -79,13 +92,18 @@ export default function App() {
   const [result, setResult] = useState(null);
   const [resolvedUrl, setResolvedUrl] = useState("");
 
-  // Preview parsing per feedback immediato (directions OR single place OR Apple Maps).
+  // Preview parsing per feedback immediato (directions OR single place OR Apple/Waze).
   // Nota: applichiamo PRIMA unwrapConsentUrl per estrarre l'URL Maps reale
   // se l'utente ha incollato un URL consent.google.com/...?continue=...
   const parsed = useMemo(() => {
     if (!resolvedUrl) return null;
     const unwrapped = unwrapConsentUrl(resolvedUrl);
-    // Apple Maps ha priorità (parser specifico)
+    // Waze (priorità: parser specifico)
+    if (/^https?:\/\/(www\.)?waze\.com/i.test(unwrapped)) {
+      try { return parseWazeUrl(unwrapped); }
+      catch (eW) { return { error: eW?.message || "URL Waze non valido" }; }
+    }
+    // Apple Maps (parser specifico)
     if (/^https?:\/\/maps\.apple\.com/i.test(unwrapped)) {
       try { return parseAppleMaps(unwrapped); }
       catch (eA) { return { error: eA?.message || "URL Apple Maps non valido" }; }
@@ -108,7 +126,7 @@ export default function App() {
 
     try {
       let urlToUse = gmapsUrl.trim();
-      if (!urlToUse) throw new Error("Incolla un link di Google Maps o Apple Maps (Indicazioni o Posizione singola).");
+      if (!urlToUse) throw new Error("Incolla un link di Google Maps, Apple Maps o Waze (Indicazioni o Posizione singola).");
 
       // FIX #19 (v2.14): se l'utente ha incollato un URL consent.google.com,
       // estraiamo il vero URL Maps dal parametro `continue=`
@@ -131,8 +149,11 @@ export default function App() {
 
       // Determina il parser appropriato in base all'host
       // FIX #20 (v2.14): supporto Apple Maps
+      // FIX #22 (v2.15): supporto Waze (priorità)
       let parsedNow;
-      if (/^https?:\/\/maps\.apple\.com/i.test(urlToUse)) {
+      if (/^https?:\/\/(www\.)?waze\.com/i.test(urlToUse)) {
+        parsedNow = parseWazeUrl(urlToUse);
+      } else if (/^https?:\/\/maps\.apple\.com/i.test(urlToUse)) {
         parsedNow = parseAppleMaps(urlToUse);
       } else {
         // Google Maps: prova directions, poi place
@@ -327,7 +348,7 @@ export default function App() {
             </span>
           </h1>
           <p className="text-sm text-gray-400 mt-2">
-            Incolla un link di <strong>Google Maps</strong> o <strong>Apple Maps</strong> (Indicazioni o Posizione singola),
+            Incolla un link di <strong>Google Maps</strong>, <strong>Apple Maps</strong> o <strong>Waze</strong> (Indicazioni o Posizione singola),
             scegli data/ora e (opzionale) checkpoint ogni X km.
           </p>
         </header>
@@ -518,6 +539,89 @@ function parseAppleMaps(urlStr) {
   }
 
   throw new Error("Link Apple Maps senza posizione riconoscibile");
+}
+
+// FIX #22 (v2.15): parser per i link Waze (waze.com / www.waze.com).
+// Formati supportati:
+//   Place:
+//     ?ll=lat,lon               → coordinate dirette
+//     ?q=Nome                   → ricerca testuale (sarà geocodata)
+//   Directions:
+//     ?to=ll.lat,lon &from=ll.lat,lon       → origin + destination via coordinate
+//     ?to=place.NomeLuogo &from=place.Nome  → origin + destination testuali
+//     ?to=ll.X,Y senza from                 → trattato come place singolo
+// Travel mode: Waze è solo auto → forzato "driving".
+// Waypoint intermedi: Waze non li supporta nei link → max 2 punti.
+//
+// FIX #23 (v2.15): se il link è uno "Share Drive" Waze (?a=share_drive),
+// è un live tracking di un viaggio in corso, non un percorso pianificato.
+// Rifiutato con messaggio di errore esplicito.
+function parseWazeUrl(urlStr) {
+  let url;
+  try { url = new URL(urlStr); } catch { throw new Error("URL Waze non valido"); }
+  if (!/(^|\.)waze\.com$/i.test(url.hostname)) throw new Error("Non è un link Waze");
+
+  const sp = url.searchParams;
+
+  // Caso speciale: Share Drive (live tracking real-time, non pianificato)
+  const action = sp.get("a");
+  if (action === "share_drive" || action === "live_drive") {
+    throw new Error(
+      'Questo è un link "Share Drive" di Waze, che condivide un viaggio in tempo reale e non un percorso pianificato. ' +
+      'Per RideMAPP serve un link a una posizione o a una rotta pianificata.'
+    );
+  }
+
+  // Helper: parsa un parametro Waze tipo "ll.LAT,LON" o "place.Nome"
+  // Ritorna { raw: "..." } compatibile con il resto del codice.
+  function parseWazeParam(value) {
+    if (!value) return null;
+    // Formato "ll.LAT,LON"
+    const llMatch = value.match(/^ll\.\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)/i);
+    if (llMatch) return { raw: `${llMatch[1]},${llMatch[2]}` };
+    // Formato "place.Nome"
+    const placeMatch = value.match(/^place\.(.+)$/i);
+    if (placeMatch) return { raw: normalizeRaw(placeMatch[1]) };
+    // Fallback: valore così com'è (raw)
+    return { raw: normalizeRaw(value) };
+  }
+
+  const to = sp.get("to");
+  const from = sp.get("from");
+
+  // DIRECTIONS: sia from che to presenti
+  if (from && to) {
+    const fromPlace = parseWazeParam(from);
+    const toPlace = parseWazeParam(to);
+    if (fromPlace && toPlace) {
+      return {
+        kind: "directions",
+        places: [fromPlace, toPlace],
+        travelMode: "driving",
+      };
+    }
+  }
+
+  // PLACE: coordinate dirette via ll=LAT,LON
+  const ll = sp.get("ll");
+  if (ll) {
+    const llMatch = ll.match(/^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$/);
+    if (llMatch) {
+      return { kind: "place", place: { raw: `${llMatch[1]},${llMatch[2]}` } };
+    }
+  }
+
+  // PLACE: solo "to" (senza from) — trattato come destinazione singola
+  if (to) {
+    const toPlace = parseWazeParam(to);
+    if (toPlace) return { kind: "place", place: toPlace };
+  }
+
+  // PLACE: ?q=Nome (ricerca testuale)
+  const q = sp.get("q");
+  if (q) return { kind: "place", place: { raw: normalizeRaw(q) } };
+
+  throw new Error("Link Waze senza posizione riconoscibile");
 }
 
 function parseGoogleMapsDirections(urlStr) {
