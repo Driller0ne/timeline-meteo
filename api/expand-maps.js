@@ -72,9 +72,26 @@ export default async function handler(req, res) {
       .replace(/&gt;/g, '>');
   }
 
+  // Normalizza escape JS/JSON tipici nei body di Google
+  // Esempi:
+  //   "https:\u002f\u002fwww.google.com\u002fmaps\u002f..."   → "https://www.google.com/maps/..."
+  //   "https:\/\/www.google.com\/maps\/..."                    → "https://www.google.com/maps/..."
+  function normalizeJsEscapes(s) {
+    return String(s)
+      .replace(/\\u002[fF]/g, '/')   // unicode escape per "/"
+      .replace(/\\\//g, '/')          // JSON escape per "/"
+      .replace(/\\u003[aA]/g, ':');   // unicode escape per ":" (raro ma capita)
+  }
+
   // Cerca un URL Google Maps in un body HTML, provando vari pattern.
   function extractMapsUrlFromHtml(html) {
     if (!html) return null;
+
+    // Pre-processa: normalizza gli escape JS/Unicode comuni nei body Google,
+    // così le regex "https://..." matchano anche quando l'HTML contiene
+    // "https:\u002f\u002f..." o "https:\/\/...".
+    const normalized = normalizeJsEscapes(html);
+
     const patterns = [
       // <meta http-equiv="refresh" content="0;url=...">
       /<meta\s+http-equiv=["']?refresh["']?[^>]*content=["'][^"']*?url=([^"'>\s]+)/i,
@@ -87,12 +104,13 @@ export default async function handler(req, res) {
       // location.replace("...") generico
       /location\.replace\(["']([^"']+)["']\)/i,
       // Anchor verso google.com/maps
-      /href=["'](https?:\/\/(?:www\.|maps\.)?google\.[a-z.]+\/maps[^"']*)["']/i,
-      // URL in JSON inline o variabili JS
-      /["'](https?:\/\/(?:www\.|maps\.)?google\.[a-z.]+\/maps\/[^"'\s]+)["']/i,
+      /href=["'](https?:\/\/(?:www\.|maps\.)?google\.[a-z.]+\/maps[^"'\s]*)["']/i,
+      // URL in JSON/JS inline (catch-all "fuzzy")
+      /(https?:\/\/(?:www\.|maps\.)?google\.[a-z.]+\/maps\/(?:place|dir|search)\/[^"'\s<>]+)/i,
     ];
+
     for (const re of patterns) {
-      const m = html.match(re);
+      const m = normalized.match(re);
       if (m && m[1]) {
         const url = htmlDecode(m[1]);
         if (isMapsLikeUrl(url)) return url;
@@ -255,6 +273,25 @@ export default async function handler(req, res) {
       hopInfo.htmlBytes = html.length;
       const fromHtml = extractMapsUrlFromHtml(html);
       hopInfo.fromHtml = fromHtml;
+
+      // Se non troviamo l'URL, includiamo nel debug alcune info per capire perché:
+      // - un campione del body (primi 1.5KB del <head>, dove di solito ci sono meta/link)
+      // - tutti gli URL "google.com/maps/..." trovati nel body (anche se nessuno è passato
+      //   da isMapsLikeUrl per qualche motivo)
+      if (!fromHtml && html) {
+        const normalized = normalizeJsEscapes(html);
+        // Sample del <head> se esiste, altrimenti i primi 1500 char
+        const headMatch = normalized.match(/<head[^>]*>([\s\S]{0,3000})<\/head>/i);
+        hopInfo.htmlHeadSample = (headMatch ? headMatch[1] : normalized.slice(0, 1500))
+          .replace(/\s+/g, ' ')
+          .slice(0, 1500);
+        // Lista degli URL google trovati (qualsiasi)
+        const allGoogleUrls = [...normalized.matchAll(
+          /https?:\/\/(?:www\.|maps\.|consent\.)?google\.[a-z.]+\/[^\s"'<>]{0,200}/gi
+        )].map(m => m[0]).slice(0, 10);
+        hopInfo.googleUrlsFound = [...new Set(allGoogleUrls)];
+      }
+
       debug.push(hopInfo);
 
       if (fromHtml) {
