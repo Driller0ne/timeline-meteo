@@ -3,6 +3,24 @@ import React, { useMemo, useState } from "react";
 /**
  * App: Timeline Meteo sul Percorso
  *
+ * v2.16 — Sessione A: default partenza + pulsanti incolla/cancella
+ *  24. Default "Partenza" calcolato in ORA LOCALE (era UTC: mostrava un orario
+ *      sbagliato di 1-2h a seconda del fuso italiano).
+ *  25. Default = "adesso + 1h, arrotondato all'ora piena". Es: alle 14:03 → 15:00.
+ *      Più realistico per pianificazione, evita il problema "il default era
+ *      già nel passato quando l'utente clicca Calcola".
+ *  26. Aggiunto pulsante "Incolla" nel campo Link (usa navigator.clipboard).
+ *      Su browser/contesti dove l'API non è disponibile (Safari iOS senza HTTPS,
+ *      vecchi browser), il pulsante mostra un messaggio amichevole e resta non
+ *      operativo, ma l'utente può sempre incollare manualmente.
+ *  27. Aggiunto pulsante "Cancella" che appare solo quando il campo Link
+ *      contiene testo.
+ *
+ *  Nota fuso orario meteo: già funzionante prima della v2.16. La chiamata a
+ *  Open-Meteo include timezone=auto, che fa restituire le ore nel fuso locale
+ *  del PUNTO geografico richiesto (Bologna→Roma, Madrid→Madrid ecc.). Quindi
+ *  le ore mostrate in timeline sono sempre corrette per ciascuna tappa.
+ *
  * v2.15 — Blocco 4 follow-up: supporto Waze
  *  22. Aggiunto parser per i link Waze (waze.com / www.waze.com).
  *      Formati supportati:
@@ -85,10 +103,14 @@ import React, { useMemo, useState } from "react";
 export default function App() {
   const [gmapsUrl, setGmapsUrl] = useState("");
   const [travelMode, setTravelMode] = useState("motorcycle"); // motorcycle | driving | cycling | walking
-  const [departLocal, setDepartLocal] = useState(() => new Date().toISOString().slice(0, 16));
+  const [departLocal, setDepartLocal] = useState(() => defaultDepartureLocal());
   const [sampleKm, setSampleKm] = useState(0); // 0 = solo tappe; >0 = checkpoint ogni X km
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  // FIX #26 (v2.16): messaggio temporaneo per warning del pulsante "Incolla"
+  // (es. clipboard API non disponibile / permesso negato). Diverso da `error`
+  // perché non è bloccante, è solo un suggerimento.
+  const [pasteWarn, setPasteWarn] = useState("");
   const [result, setResult] = useState(null);
   const [resolvedUrl, setResolvedUrl] = useState("");
 
@@ -355,13 +377,53 @@ export default function App() {
 
         <div className="bg-neutral-800 rounded-2xl shadow p-4 space-y-4">
           <label className="block">
-            <span className="text-sm font-medium">Link Google Maps</span>
-            <input
-              className="mt-1 w-full rounded-xl border border-gray-600 bg-neutral-700 text-gray-100 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-orange-500"
-              placeholder="https://www.google.com/maps/dir/?api=1&origin=...&destination=..."
-              value={gmapsUrl}
-              onChange={(e) => setGmapsUrl(e.target.value)}
-            />
+            <span className="text-sm font-medium">Link Google Maps, Apple Maps o Waze</span>
+            <div className="relative mt-1">
+              <input
+                className="w-full rounded-xl border border-gray-600 bg-neutral-700 text-gray-100 px-3 py-2 pr-28 focus:outline-none focus:ring-2 focus:ring-orange-500"
+                placeholder="https://www.google.com/maps/dir/?api=1&origin=...&destination=..."
+                value={gmapsUrl}
+                onChange={(e) => { setGmapsUrl(e.target.value); if (pasteWarn) setPasteWarn(""); }}
+              />
+              {/* Pulsanti incolla / cancella sovrapposti a destra dell'input */}
+              <div className="absolute right-1 top-1/2 -translate-y-1/2 flex items-center gap-1">
+                {gmapsUrl && (
+                  <button
+                    type="button"
+                    onClick={() => { setGmapsUrl(""); setPasteWarn(""); setError(""); }}
+                    aria-label="Cancella"
+                    title="Cancella"
+                    className="w-7 h-7 flex items-center justify-center rounded-lg text-gray-400 hover:text-gray-100 hover:bg-neutral-600 text-lg leading-none"
+                  >
+                    ✕
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={async () => {
+                    const res = await readClipboardSafe();
+                    if (res.ok && res.text) {
+                      setGmapsUrl(res.text.trim());
+                      setPasteWarn("");
+                      setError("");
+                    } else if (res.ok && !res.text) {
+                      setPasteWarn("Il clipboard è vuoto.");
+                      setTimeout(() => setPasteWarn(""), 4000);
+                    } else {
+                      setPasteWarn("Non riesco a leggere il clipboard. Incollalo manualmente nel campo.");
+                      setTimeout(() => setPasteWarn(""), 6000);
+                    }
+                  }}
+                  className="px-3 py-1 rounded-lg bg-neutral-600 hover:bg-orange-500 text-gray-100 text-sm font-medium transition-colors"
+                  title="Incolla dal clipboard"
+                >
+                  Incolla
+                </button>
+              </div>
+            </div>
+            {pasteWarn && (
+              <p className="text-xs text-amber-400 mt-1">{pasteWarn}</p>
+            )}
           </label>
 
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
@@ -465,6 +527,42 @@ async function expandShortMaps(shortUrl) {
     if (location && !isShortGmaps(location)) return location;
   } catch {}
   return null;
+}
+
+// FIX #24/#25 (v2.16): default per il campo "Partenza".
+// Calcola "adesso + 1h, arrotondato all'ora piena", in ORA LOCALE.
+// Es: 14:03 → 15:00, 14:50 → 16:00, 23:30 → 01:00 del giorno dopo.
+// Il valore è formattato come stringa "YYYY-MM-DDTHH:mm" compatibile con
+// <input type="datetime-local">, NEL fuso orario dell'utente.
+function defaultDepartureLocal() {
+  const now = new Date();
+  // +1h, poi azzeriamo minuti/secondi/ms → arrotondamento all'ora piena successiva
+  const target = new Date(now.getTime() + 60 * 60 * 1000);
+  target.setMinutes(0, 0, 0);
+  // Formato locale "YYYY-MM-DDTHH:mm"
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${target.getFullYear()}-${pad(target.getMonth() + 1)}-${pad(target.getDate())}` +
+         `T${pad(target.getHours())}:${pad(target.getMinutes())}`;
+}
+
+// FIX #26 (v2.16): wrapper per Clipboard API (compatibile con vari browser).
+// Ritorna { ok: true, text } se è riuscito a leggere, altrimenti { ok: false, reason }.
+async function readClipboardSafe() {
+  // Controllo disponibilità API
+  if (!navigator?.clipboard?.readText) {
+    return { ok: false, reason: "API non disponibile in questo browser" };
+  }
+  // Controllo contesto sicuro (HTTPS richiesto da molti browser)
+  if (typeof window !== "undefined" && window.isSecureContext === false) {
+    return { ok: false, reason: "Lettura clipboard non consentita su HTTP (serve HTTPS)" };
+  }
+  try {
+    const text = await navigator.clipboard.readText();
+    return { ok: true, text: String(text || "") };
+  } catch (e) {
+    // Permesso negato dall'utente o dal browser (es. Safari iOS richiede gesture esplicita)
+    return { ok: false, reason: e?.message || "Permesso negato" };
+  }
 }
 
 function normalizeRaw(s) { return String(s).replace(/\+/g, " ").replace(/\s+/g, " ").trim(); }
