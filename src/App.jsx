@@ -1,7 +1,24 @@
-import React, { useMemo, useState } from "react";
+import React, { useMemo, useState, useEffect, useRef } from "react";
+import { MapContainer, TileLayer, Marker, Popup, Polyline, useMap } from "react-leaflet";
+import L from "leaflet";
+import "leaflet/dist/leaflet.css";
 
 /**
  * App: Timeline Meteo sul Percorso
+ *
+ * v2.17 — Sessione B: mappa Leaflet + meteo sovraimpresso
+ *  28. Aggiunta mappa interattiva con OpenStreetMap (CartoDB Positron tiles).
+ *      Layout: affiancata alla timeline su desktop (lg:), sotto su mobile.
+ *      Container allargato a max-w-7xl per ospitare entrambe le viste.
+ *  29. Polyline arancione (#fd5216) della rotta usando geometry da OSRM.
+ *      In caso di posizione singola: niente polyline, solo marker centrato.
+ *  30. Marker custom (divIcon HTML) per ogni tappa/checkpoint, con emoji
+ *      meteo + temperatura + ora di arrivo (opzione C). Click apre popup
+ *      con dettagli completi (località, km, mm pioggia, vento).
+ *  31. Auto-fit del bounding box quando arriva un risultato.
+ *  32. Controlli zoom +/- in alto a sinistra (default Leaflet) +
+ *      pulsante custom "Espandi" che porta la mappa a tutto schermo
+ *      (utile su mobile).
  *
  * v2.16 — Sessione A: default partenza + pulsanti incolla/cancella
  *  24. Default "Partenza" calcolato in ORA LOCALE (era UTC: mostrava un orario
@@ -346,6 +363,9 @@ export default function App() {
         schedule: enriched,
         profile,
         warning,
+        // FIX #29 (v2.17): salva la geometria del percorso da OSRM per il render mappa.
+        // Array di [lon, lat] (verrà invertito in [lat, lon] nel componente).
+        routeGeometry: route.geometry?.coordinates || null,
       });
     } catch (e) {
       setError((e && e.message) || String(e));
@@ -355,8 +375,10 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen w-screen bg-neutral-900 text-gray-100 md:flex md:justify-center p-6 md:pt-12">
-      <div className="w-full max-w-3xl md:mx-auto">
+    <div className="min-h-screen w-screen bg-neutral-900 text-gray-100 p-6 md:pt-12">
+      <div className="w-full max-w-7xl mx-auto">
+        {/* Sezione "stabile": header + form, sempre centrati su 3xl */}
+        <div className="max-w-3xl mx-auto">
         <header className="mb-6">
           <h1 className="w-full text-center font-extrabold tracking-tight">
             <span className="block text-6xl sm:text-7xl text-orange-500 uppercase leading-none">
@@ -482,8 +504,19 @@ export default function App() {
             </div>
           )}
         </div>
+        </div>{/* /max-w-3xl sub-container (chiude header+form) */}
 
-        {result && <ResultView data={result} />}
+        {/* Sezione risultato: grid 1col su mobile, 2col su desktop (lg:) */}
+        {result && (
+          <div className="mt-6 grid grid-cols-1 lg:grid-cols-2 gap-6">
+            <div className="min-w-0">
+              <ResultView data={result} />
+            </div>
+            <div className="lg:sticky lg:top-6 h-[420px] lg:h-[calc(100vh-6rem)] lg:max-h-[760px]">
+              <RouteMap data={result} />
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -1222,3 +1255,240 @@ function weatherCodeToIcon(code) {
 }
 
 function weatherCodeToText(code) { const map = { 0: "Sereno", 1: "Prevalentemente sereno", 2: "Parzialmente nuvoloso", 3: "Coperto", 45: "Nebbia", 48: "Nebbia con brina", 51: "Pioviggine leggera", 53: "Pioviggine", 55: "Pioviggine intensa", 56: "Pioggia gelata leggera", 57: "Pioggia gelata", 61: "Pioggia debole", 63: "Pioggia", 65: "Pioggia forte", 66: "Rovescio gelato leggero", 67: "Rovescio gelato", 71: "Neve debole", 73: "Neve", 75: "Neve forte", 77: "Granelli di neve", 80: "Rovesci leggeri", 81: "Rovesci", 82: "Rovesci intensi", 85: "Rovesci di neve leggeri", 86: "Rovesci di neve intensi", 95: "Temporale", 96: "Temporale con grandine", 99: "Temporale con grandine forte" }; return map?.[code] ?? `Codice meteo ${code}`; }
+
+
+// ============================================================================
+// FIX #28-32 (v2.17): mappa Leaflet con polyline rotta + marker meteo
+// ============================================================================
+
+// Helper componente: chiama map.fitBounds() ogni volta che i bounds cambiano.
+// Va dentro <MapContainer>, perché ha bisogno dell'hook useMap().
+function FitBoundsOnChange({ bounds }) {
+  const map = useMap();
+  useEffect(() => {
+    if (!bounds) return;
+    try {
+      map.fitBounds(bounds, { padding: [40, 40], maxZoom: 14 });
+    } catch {}
+  }, [bounds, map]);
+  return null;
+}
+
+// Helper: invalidate map size dopo che il container è stato montato/resized
+// (Leaflet ha bisogno di sapere quanto è grande il suo wrapper, e a volte non
+// se ne accorge da solo se il container nasce con dimensioni dinamiche).
+function InvalidateSizeOnResize() {
+  const map = useMap();
+  useEffect(() => {
+    const t = setTimeout(() => map.invalidateSize(), 100);
+    const onResize = () => map.invalidateSize();
+    window.addEventListener("resize", onResize);
+    return () => {
+      clearTimeout(t);
+      window.removeEventListener("resize", onResize);
+    };
+  }, [map]);
+  return null;
+}
+
+// Costruisce un divIcon Leaflet personalizzato per una tappa.
+// Mostra: emoji meteo grande, temperatura, ora di arrivo (opzione C).
+// Il colore di sfondo del pin varia in base al tipo (start/end/sample).
+function buildWeatherDivIcon(wp) {
+  const W = wp.weather;
+  const icon = W ? weatherCodeToIcon(W.weathercode) : "📍";
+  const temp = W && Number.isFinite(W.temperature_2m) ? `${Math.round(W.temperature_2m)}°` : "";
+  const dt = new Date(wp.at);
+  const pad = (n) => String(n).padStart(2, "0");
+  const hhmm = `${pad(dt.getHours())}:${pad(dt.getMinutes())}`;
+
+  // Colore bordo in base al tipo
+  let border = "#fd5216"; // default: tappa/checkpoint
+  if (wp.type === "start") border = "#22c55e";   // verde: partenza
+  else if (wp.type === "legEnd") border = "#fd5216"; // arancione: tappa
+  else if (wp.type === "sample") border = "#9ca3af"; // grigio: checkpoint km
+
+  const html = `
+    <div style="
+      background: white;
+      border: 2px solid ${border};
+      border-radius: 12px;
+      padding: 2px 6px 4px 6px;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.25);
+      text-align: center;
+      min-width: 44px;
+      font-family: system-ui, -apple-system, sans-serif;
+      line-height: 1.1;
+    ">
+      <div style="font-size: 18px;">${icon}</div>
+      <div style="font-size: 13px; font-weight: 700; color: #111;">${temp}</div>
+      <div style="font-size: 10px; color: #555; font-variant-numeric: tabular-nums;">${hhmm}</div>
+    </div>
+  `;
+  return L.divIcon({
+    html,
+    className: "ridemapp-marker", // niente stili default Leaflet
+    iconSize: [56, 56],
+    iconAnchor: [28, 56], // punta in basso al centro
+    popupAnchor: [0, -56],
+  });
+}
+
+function RouteMap({ data }) {
+  const containerRef = useRef(null);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+
+  // Estrae le coordinate della polyline (se presenti)
+  // Geometry da OSRM è [lon, lat], Leaflet vuole [lat, lon] → inverto.
+  const polyline = useMemo(() => {
+    const coords = data?.routeGeometry;
+    if (!coords || !Array.isArray(coords) || coords.length < 2) return null;
+    return coords.map((c) => [c[1], c[0]]);
+  }, [data]);
+
+  // Calcola i bounds da tutte le tappe + (se presente) la polyline
+  const bounds = useMemo(() => {
+    const pts = [];
+    for (const wp of data?.schedule || []) {
+      if (Number.isFinite(wp?.place?.lat) && Number.isFinite(wp?.place?.lon)) {
+        pts.push([wp.place.lat, wp.place.lon]);
+      }
+    }
+    if (polyline) {
+      for (const p of polyline) pts.push(p);
+    }
+    if (pts.length === 0) return null;
+    if (pts.length === 1) {
+      // Singolo punto: bounds artificiali per evitare un crash di fitBounds
+      const [lat, lon] = pts[0];
+      const d = 0.02;
+      return [[lat - d, lon - d], [lat + d, lon + d]];
+    }
+    return pts;
+  }, [data, polyline]);
+
+  // Centro iniziale (Italia) se non ci sono bounds
+  const initialCenter = bounds ? null : [42.5, 12.5];
+
+  // Pulsante "Espandi" — toggle fullscreen via API browser nativa
+  function toggleFullscreen() {
+    const el = containerRef.current;
+    if (!el) return;
+    if (!document.fullscreenElement) {
+      el.requestFullscreen?.()
+        .then(() => setIsFullscreen(true))
+        .catch(() => {});
+    } else {
+      document.exitFullscreen?.()
+        .then(() => setIsFullscreen(false))
+        .catch(() => {});
+    }
+  }
+
+  // Listener per uscita da fullscreen via Esc o pulsante browser
+  useEffect(() => {
+    const onFsChange = () => setIsFullscreen(!!document.fullscreenElement);
+    document.addEventListener("fullscreenchange", onFsChange);
+    return () => document.removeEventListener("fullscreenchange", onFsChange);
+  }, []);
+
+  if (!bounds && !initialCenter) {
+    return null;
+  }
+
+  return (
+    <div
+      ref={containerRef}
+      className="relative w-full h-full rounded-2xl overflow-hidden shadow border border-neutral-700 bg-neutral-800"
+    >
+      {/* Pulsante "Espandi a tutto schermo" — overlay in alto a destra */}
+      <button
+        type="button"
+        onClick={toggleFullscreen}
+        title={isFullscreen ? "Esci da tutto schermo" : "Espandi a tutto schermo"}
+        aria-label={isFullscreen ? "Esci da tutto schermo" : "Espandi a tutto schermo"}
+        className="absolute top-2 right-2 z-[1000] w-9 h-9 flex items-center justify-center rounded-lg bg-white/95 hover:bg-orange-500 hover:text-white text-gray-800 text-base shadow border border-gray-300 transition-colors"
+      >
+        {isFullscreen ? "⤡" : "⛶"}
+      </button>
+
+      <MapContainer
+        center={initialCenter || [42.5, 12.5]}
+        zoom={6}
+        scrollWheelZoom={true}
+        zoomControl={true}
+        style={{ width: "100%", height: "100%", background: "#f8f8f8" }}
+      >
+        {/* Tile layer: CartoDB Positron (minimal grey, marker meteo risaltano) */}
+        <TileLayer
+          attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/">CARTO</a>'
+          url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png"
+          subdomains={["a", "b", "c", "d"]}
+          maxZoom={19}
+        />
+
+        {/* Polyline della rotta (se presente) */}
+        {polyline && (
+          <Polyline
+            positions={polyline}
+            pathOptions={{
+              color: "#fd5216",
+              weight: 4,
+              opacity: 0.85,
+              lineCap: "round",
+              lineJoin: "round",
+            }}
+          />
+        )}
+
+        {/* Marker per ciascuna tappa */}
+        {(data?.schedule || []).map((wp, idx) => {
+          if (!Number.isFinite(wp?.place?.lat) || !Number.isFinite(wp?.place?.lon)) return null;
+          return (
+            <Marker
+              key={idx}
+              position={[wp.place.lat, wp.place.lon]}
+              icon={buildWeatherDivIcon(wp)}
+            >
+              <Popup>
+                <MarkerPopupContent wp={wp} />
+              </Popup>
+            </Marker>
+          );
+        })}
+
+        {bounds && <FitBoundsOnChange bounds={bounds} />}
+        <InvalidateSizeOnResize />
+      </MapContainer>
+    </div>
+  );
+}
+
+function MarkerPopupContent({ wp }) {
+  const W = wp.weather;
+  const dt = new Date(wp.at);
+  const pad = (n) => String(n).padStart(2, "0");
+  const hhmm = `${pad(dt.getHours())}:${pad(dt.getMinutes())}`;
+  const kmFromStart = Math.round(wp.km || 0);
+  const titleBase = formatPlaceLabel(wp.place);
+  const title = wp?.place?.prov ? `${titleBase}, ${wp.place.prov}` : titleBase;
+  const meteoText = W ? weatherCodeToText(W.weathercode) : "";
+  const temp = W && Number.isFinite(W.temperature_2m) ? `${Math.round(W.temperature_2m)}°C` : "—";
+  const rain = W && Number.isFinite(W.precipitation) ? `${(+W.precipitation).toFixed(1)} mm` : "—";
+  const wind = W && Number.isFinite(W.wind_speed_10m) ? `${Math.round(W.wind_speed_10m)} km/h` : "—";
+
+  return (
+    <div style={{ fontFamily: "system-ui, sans-serif", minWidth: 180 }}>
+      <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 4, color: "#111" }}>{title}</div>
+      <div style={{ fontSize: 12, color: "#555", marginBottom: 6 }}>
+        {hhmm} · {kmFromStart} km dall'inizio
+      </div>
+      <div style={{ fontSize: 13, color: "#333", marginBottom: 6 }}>{meteoText}</div>
+      <div style={{ display: "grid", gridTemplateColumns: "auto 1fr", gap: "2px 8px", fontSize: 12, color: "#444" }}>
+        <span>🌡️</span><span>{temp}</span>
+        <span>💧</span><span>{rain}</span>
+        <span>💨</span><span>{wind}</span>
+      </div>
+    </div>
+  );
+}
