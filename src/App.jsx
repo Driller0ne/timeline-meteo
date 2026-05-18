@@ -6,21 +6,6 @@ import "leaflet/dist/leaflet.css";
 /**
  * App: Timeline Meteo sul Percorso
  *
- * v2.20 — Toggle "Evita autostrade" (versione minimale, post-rollback v2.19)
- *  39. Aggiunto checkbox "Evita autostrade" nel form. Se attivo, OSRM
- *      viene chiamato con `?exclude=motorway`. Solo controllo manuale via UI:
- *      NESSUN parsing/auto-detect dal link (la v2.19 aveva tentato l'auto-detect
- *      ma introduceva regressioni difficili da diagnosticare).
- *  40. Gestione esplicita di OSRM code "NoRoute": messaggio chiaro che
- *      suggerisce di disattivare il toggle se il percorso è obbligato in autostrada.
- *  41. Badge "🛣️ Rotta calcolata senza autostrade" nel Riepilogo quando attivo.
- *
- *  Caveat noti su OSRM exclude=motorway:
- *   - Esclude solo highway=motorway (autostrade A1/A14/ecc.), NON trunk
- *     (raccordi, strade extra-urbane principali).
- *   - Se origine/destinazione sono obbligate su autostrada, OSRM può rispondere
- *     "NoRoute": l'utente deve disattivare il toggle.
- *
  * v2.18 — Fix difensivi (race conditions + geocoder strict + OSRM validation)
  *  33. setLoading(true) spostato in CIMA a onRun(), prima di qualsiasi await.
  *      Prima era dentro i branch (place/directions) DOPO l'espansione del
@@ -167,8 +152,6 @@ export default function App() {
   // (es. clipboard API non disponibile / permesso negato). Diverso da `error`
   // perché non è bloccante, è solo un suggerimento.
   const [pasteWarn, setPasteWarn] = useState("");
-  // FIX #39 (v2.20): toggle "Evita autostrade". Controllo SOLO manuale via UI.
-  const [avoidHighways, setAvoidHighways] = useState(false);
   // FIX #34 (v2.18): race-condition guard. Ogni onRun() ottiene un ID
   // incrementale. Solo l'ultima invocazione "vince": le precedenti, se
   // ancora in corso, NON applicano più i loro setState.
@@ -353,37 +336,12 @@ export default function App() {
       // Routing OSRM (alias: "motorcycle" => driving)
       const osrmProfile = travelMode === "motorcycle" ? "driving" : travelMode;
       const coordsPath = places.map((p) => `${p.lon},${p.lat}`).join(";");
-      // FIX #39 (v2.20): se l'utente ha attivato "evita autostrade",
-      // aggiungiamo ?exclude=motorway alla query OSRM.
-      const osrmParams = new URLSearchParams({
-        overview: "full",
-        geometries: "geojson",
-        steps: "false",
-        annotations: "distance,duration",
-      });
-      if (avoidHighways) osrmParams.set("exclude", "motorway");
-      const osrmUrl = `https://router.project-osrm.org/route/v1/${osrmProfile}/${coordsPath}?${osrmParams.toString()}`;
+      const osrmUrl = `https://router.project-osrm.org/route/v1/${osrmProfile}/${coordsPath}?overview=full&geometries=geojson&steps=false&annotations=distance,duration`;
 
       const routeResp = await fetch(osrmUrl);
       if (!isCurrent()) return;
       if (!routeResp.ok) throw new Error("Errore routing OSRM");
       const routeJson = await routeResp.json();
-
-      // FIX #40 (v2.20): gestione esplicita di "NoRoute" da OSRM.
-      // Particolarmente comune con exclude=motorway se origine/destinazione
-      // sono obbligate sull'autostrada o non c'è alternativa praticabile.
-      if (routeJson.code && routeJson.code !== "Ok") {
-        if (routeJson.code === "NoRoute" && avoidHighways) {
-          throw new Error(
-            `Nessun percorso trovato evitando le autostrade. ` +
-            `Le coordinate potrebbero essere obbligate sull'autostrada, ` +
-            `oppure non esiste un'alternativa secondaria. ` +
-            `Prova a disattivare "Evita autostrade" o a usare un link con tappe diverse.`
-          );
-        }
-        throw new Error(`OSRM: ${routeJson.message || routeJson.code}`);
-      }
-
       const route = routeJson.routes?.[0];
       if (!route) throw new Error("Percorso non trovato");
 
@@ -483,9 +441,6 @@ export default function App() {
         // FIX #29 (v2.17): salva la geometria del percorso da OSRM per il render mappa.
         // Array di [lon, lat] (verrà invertito in [lat, lon] nel componente).
         routeGeometry: route.geometry?.coordinates || null,
-        // FIX #39 (v2.20): segna se la rotta è stata calcolata senza autostrade
-        // (per il badge nel Riepilogo).
-        avoidHighways,
       });
     } catch (e) {
       // FIX #35: setResult(null) difensivo anche nel catch generale
@@ -610,17 +565,6 @@ export default function App() {
               />
             </label>
           </div>
-
-          {/* FIX #39 (v2.20): toggle Evita autostrade (solo controllo manuale) */}
-          <label className="flex items-center gap-2 cursor-pointer select-none">
-            <input
-              type="checkbox"
-              checked={avoidHighways}
-              onChange={(e) => setAvoidHighways(e.target.checked)}
-              className="w-4 h-4 accent-orange-500 cursor-pointer"
-            />
-            <span className="text-sm font-medium">Evita autostrade</span>
-          </label>
 
           <div className="flex gap-3 items-center">
             <button
@@ -1317,9 +1261,6 @@ function ResultView({ data }) {
             : <>Profilo: <span className="font-mono">{data.profile}</span> · Totale: {totalKm} km · {totalDur}</>
           }
         </p>
-        {data.avoidHighways && (
-          <p className="text-xs text-orange-400 mt-1">🛣️ Rotta calcolata senza autostrade</p>
-        )}
       </div>
       <div className="space-y-4">
         {data.schedule.map((wp, idx) => (
