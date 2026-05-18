@@ -6,6 +6,27 @@ import "leaflet/dist/leaflet.css";
 /**
  * App: Timeline Meteo sul Percorso
  *
+ * v2.19 — Evita autostrade (toggle UI + auto-detect dal link Google)
+ *  39. Aggiunto toggle "Evita autostrade" nel form. Se attivo, OSRM viene
+ *      chiamato con `?exclude=motorway` (supportato dal server demo OSRM).
+ *  40. Parser best-effort che rileva il flag "evita autostrade" da link
+ *      Google Maps espansi. Cerca in vari posti:
+ *        - dirflg=dh / dirflg=h (formato legacy)
+ *        - avoid=highways (formato api=1)
+ *        - !2b1 dentro data=!... (protobuf inline, fragile)
+ *      Se rilevato, pre-spunta automaticamente il toggle UI con un hint
+ *      "rilevato dal link". L'utente può sempre override manualmente.
+ *  41. Gestione errori OSRM "NoRoute": se nessun percorso trovato con
+ *      autostrade escluse, messaggio esplicito che suggerisce di
+ *      disattivare il toggle o usare un link con coordinate diverse.
+ *
+ *  Caveat noti su OSRM exclude=motorway:
+ *   - OSRM esclude solo highway=motorway (= autostrade A1/A14/ecc.), NON
+ *     trunk (= strade extra-urbane principali tipo raccordi). Se la rotta
+ *     usa una trunk, l'utente potrebbe vederla comunque.
+ *   - Se l'origine/destinazione sono in uno snodo autostradale e non
+ *     c'è alternativa, OSRM può ritornare "NoRoute".
+ *
  * v2.18 — Fix difensivi (race conditions + geocoder strict + OSRM validation)
  *  33. setLoading(true) spostato in CIMA a onRun(), prima di qualsiasi await.
  *      Prima era dentro i branch (place/directions) DOPO l'espansione del
@@ -152,6 +173,12 @@ export default function App() {
   // (es. clipboard API non disponibile / permesso negato). Diverso da `error`
   // perché non è bloccante, è solo un suggerimento.
   const [pasteWarn, setPasteWarn] = useState("");
+  // FIX #39 (v2.19): toggle "Evita autostrade"
+  const [avoidHighways, setAvoidHighways] = useState(false);
+  // FIX #40 (v2.19): flag true se l'ultima volta che abbiamo parsato un link
+  // abbiamo rilevato il flag "evita autostrade" dentro l'URL Google. Lo
+  // mostriamo come hint visivo accanto al toggle ("rilevato dal link").
+  const [avoidHighwaysAutoDetected, setAvoidHighwaysAutoDetected] = useState(false);
   // FIX #34 (v2.18): race-condition guard. Ogni onRun() ottiene un ID
   // incrementale. Solo l'ultima invocazione "vince": le precedenti, se
   // ancora in corso, NON applicano più i loro setState.
@@ -226,6 +253,20 @@ export default function App() {
       }
       if (!isCurrent()) return;
       setResolvedUrl(urlToUse);
+
+      // FIX #40 (v2.19): auto-detect "evita autostrade" dal link.
+      // Se rilevato, attiviamo automaticamente il toggle (con hint visivo).
+      // L'utente può comunque overridere manualmente prima del prossimo click.
+      const detected = detectAvoidHighways(urlToUse);
+      if (detected && !avoidHighways) {
+        setAvoidHighways(true);
+        setAvoidHighwaysAutoDetected(true);
+      } else if (!detected) {
+        // Reset del flag auto-detected se non più rilevato
+        setAvoidHighwaysAutoDetected(false);
+      }
+      // Valore effettivo da usare per OSRM in questa esecuzione
+      const useAvoidHighways = detected || avoidHighways;
 
       // Determina il parser appropriato in base all'host
       // FIX #20 (v2.14): supporto Apple Maps
@@ -336,12 +377,37 @@ export default function App() {
       // Routing OSRM (alias: "motorcycle" => driving)
       const osrmProfile = travelMode === "motorcycle" ? "driving" : travelMode;
       const coordsPath = places.map((p) => `${p.lon},${p.lat}`).join(";");
-      const osrmUrl = `https://router.project-osrm.org/route/v1/${osrmProfile}/${coordsPath}?overview=full&geometries=geojson&steps=false&annotations=distance,duration`;
+      // FIX #39 (v2.19): se l'utente ha attivato "evita autostrade",
+      // aggiungiamo ?exclude=motorway alla query OSRM.
+      const osrmParams = new URLSearchParams({
+        overview: "full",
+        geometries: "geojson",
+        steps: "false",
+        annotations: "distance,duration",
+      });
+      if (useAvoidHighways) osrmParams.set("exclude", "motorway");
+      const osrmUrl = `https://router.project-osrm.org/route/v1/${osrmProfile}/${coordsPath}?${osrmParams.toString()}`;
 
       const routeResp = await fetch(osrmUrl);
       if (!isCurrent()) return;
       if (!routeResp.ok) throw new Error("Errore routing OSRM");
       const routeJson = await routeResp.json();
+
+      // FIX #41 (v2.19): gestione esplicita di "NoRoute" da OSRM.
+      // Particolarmente comune con exclude=motorway se origine/destinazione
+      // sono in uno snodo autostradale o se non c'è alternativa praticabile.
+      if (routeJson.code && routeJson.code !== "Ok") {
+        if (routeJson.code === "NoRoute" && useAvoidHighways) {
+          throw new Error(
+            `Nessun percorso trovato evitando le autostrade. ` +
+            `Le coordinate potrebbero essere obbligate sull'autostrada, ` +
+            `oppure non esiste un'alternativa secondaria. ` +
+            `Prova a disattivare "Evita autostrade" o a usare un link con tappe diverse.`
+          );
+        }
+        throw new Error(`OSRM: ${routeJson.message || routeJson.code}`);
+      }
+
       const route = routeJson.routes?.[0];
       if (!route) throw new Error("Percorso non trovato");
 
@@ -441,6 +507,9 @@ export default function App() {
         // FIX #29 (v2.17): salva la geometria del percorso da OSRM per il render mappa.
         // Array di [lon, lat] (verrà invertito in [lat, lon] nel componente).
         routeGeometry: route.geometry?.coordinates || null,
+        // FIX #39 (v2.19): se la rotta è stata calcolata con "evita autostrade",
+        // lo segniamo nel risultato (visualizzato come badge accanto al Riepilogo).
+        avoidHighways: useAvoidHighways,
       });
     } catch (e) {
       // FIX #35: setResult(null) difensivo anche nel catch generale
@@ -566,6 +635,24 @@ export default function App() {
             </label>
           </div>
 
+          {/* FIX #39 (v2.19): toggle Evita autostrade */}
+          <label className="flex items-center gap-2 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={avoidHighways}
+              onChange={(e) => {
+                setAvoidHighways(e.target.checked);
+                // Se l'utente tocca manualmente il toggle, l'hint "rilevato dal link" non è più rilevante
+                if (avoidHighwaysAutoDetected) setAvoidHighwaysAutoDetected(false);
+              }}
+              className="w-4 h-4 accent-orange-500 cursor-pointer"
+            />
+            <span className="text-sm font-medium">Evita autostrade</span>
+            {avoidHighwaysAutoDetected && (
+              <span className="text-xs text-orange-400 italic">(rilevato dal link)</span>
+            )}
+          </label>
+
           <div className="flex gap-3 items-center">
             <button
               onClick={onRun}
@@ -683,6 +770,47 @@ function normalizeRaw(s) { return String(s).replace(/\+/g, " ").replace(/\s+/g, 
 // (consent.google.com/m, consent.google.com/ml, ecc.), estrae il vero URL Maps
 // dal parametro `continue=`. Altrimenti ritorna l'URL originale invariato.
 // Si applica all'URL incollato dall'utente PRIMA di qualsiasi parser.
+// FIX #40 (v2.19): best-effort detection del flag "evita autostrade" da
+// un link Google Maps. Restituisce true se il flag è chiaramente presente,
+// false altrimenti. Cerca in vari formati:
+//   1. dirflg=dh, dirflg=hd, dirflg=h (formato legacy): la lettera "h"
+//      nel dirflg indica "avoid highways"
+//   2. avoid=highways o avoid=highways,tolls (formato moderno ?api=1)
+//   3. !2b1 dentro data=!... (protobuf inline). Note: codifica fragile,
+//      Google può cambiarla — usiamo solo come best-effort.
+// Per Apple Maps e Waze: nessun flag affidabile nei link → restituisce false.
+function detectAvoidHighways(urlStr) {
+  if (!urlStr) return false;
+  let url;
+  try { url = new URL(urlStr); } catch { return false; }
+
+  // Apple Maps e Waze non hanno il flag affidabile → false
+  if (url.hostname === "maps.apple.com") return false;
+  if (/(^|\.)waze\.com$/i.test(url.hostname)) return false;
+
+  const sp = url.searchParams;
+
+  // 1) Formato legacy: dirflg=dh / dirflg=h / dirflg=hd
+  const dirflg = sp.get("dirflg");
+  if (dirflg && /h/i.test(dirflg)) return true;
+
+  // 2) Formato moderno api=1: avoid=highways
+  const avoid = sp.get("avoid");
+  if (avoid && /highways?/i.test(avoid)) return true;
+
+  // 3) Protobuf inline: data=!4m...!2b1!... (fragile, best-effort)
+  // Il flag "avoid highways" è tipicamente codificato come !2b1 in un
+  // certo contesto. È una euristica: cerchiamo la stringa esatta.
+  const dataParam = sp.get("data") || url.pathname;
+  // Cerca pattern "!N b 1" dove N è 1, 2 o 3 e c'è coerenza con avoid flags.
+  // Per essere conservativi accettiamo solo se il "data" contiene specificamente
+  // "!2b1" o "!1b1" (avoid tolls) o "!3b1" (avoid ferries), ma esponiamo solo
+  // il caso "evita autostrade" (!2b1).
+  if (/!2b1(?:!|$)/.test(dataParam)) return true;
+
+  return false;
+}
+
 function unwrapConsentUrl(urlStr) {
   try {
     const u = new URL(urlStr);
@@ -1261,6 +1389,9 @@ function ResultView({ data }) {
             : <>Profilo: <span className="font-mono">{data.profile}</span> · Totale: {totalKm} km · {totalDur}</>
           }
         </p>
+        {data.avoidHighways && (
+          <p className="text-xs text-orange-400 mt-1">🛣️ Rotta calcolata senza autostrade</p>
+        )}
       </div>
       <div className="space-y-4">
         {data.schedule.map((wp, idx) => (
