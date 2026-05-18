@@ -6,6 +6,30 @@ import "leaflet/dist/leaflet.css";
 /**
  * App: Timeline Meteo sul Percorso
  *
+ * v2.18 — Fix difensivi (race conditions + geocoder strict + OSRM validation)
+ *  33. setLoading(true) spostato in CIMA a onRun(), prima di qualsiasi await.
+ *      Prima era dentro i branch (place/directions) DOPO l'espansione del
+ *      link short, che con ScrapingBee può durare 5-10s: in quella finestra
+ *      il bottone era ancora abilitato e si potevano lanciare onRun() in
+ *      parallelo (race condition → errore visibile + risultato vecchio).
+ *  34. Race-condition guard con runIdRef: ogni onRun() ottiene un ID
+ *      incrementale; solo l'ultima invocazione può applicare i suoi
+ *      setState finali. Le precedenti vengono "ignorate" se l'utente ha
+ *      cliccato di nuovo nel frattempo.
+ *  35. setResult(null) esplicito in tutti i rami di errore/early-return,
+ *      per garantire che il risultato precedente non resti visibile insieme
+ *      a un nuovo messaggio di errore.
+ *  36. Photon ora hard-filter su countrycode === "IT": se nessun risultato
+ *      italiano, ritorna null (prima accettava il primo risultato globale,
+ *      causando "collassi" di tappe diverse sulle stesse coordinate).
+ *      L'app resta "Italia-centric" sui geocoder testuali, ma continua a
+ *      funzionare ovunque nel mondo se il link contiene coordinate dirette.
+ *  37. Validazione OSRM: se la rotta totale ha distance < 100m oppure
+ *      qualche leg ha distance === 0, errore esplicito invece di mostrare
+ *      una timeline finta con tutti i punti collassati.
+ *  38. Sanity check geocoding: se ≥3 tappe finiscono entro 500m l'una
+ *      dall'altra (sospetto collasso da geocoder generico), errore esplicito.
+ *
  * v2.17 — Sessione B: mappa Leaflet + meteo sovraimpresso
  *  28. Aggiunta mappa interattiva con OpenStreetMap (CartoDB Positron tiles).
  *      Layout: affiancata alla timeline su desktop (lg:), sotto su mobile.
@@ -128,6 +152,10 @@ export default function App() {
   // (es. clipboard API non disponibile / permesso negato). Diverso da `error`
   // perché non è bloccante, è solo un suggerimento.
   const [pasteWarn, setPasteWarn] = useState("");
+  // FIX #34 (v2.18): race-condition guard. Ogni onRun() ottiene un ID
+  // incrementale. Solo l'ultima invocazione "vince": le precedenti, se
+  // ancora in corso, NON applicano più i loro setState.
+  const runIdRef = useRef(0);
   const [result, setResult] = useState(null);
   const [resolvedUrl, setResolvedUrl] = useState("");
 
@@ -159,6 +187,15 @@ export default function App() {
   }, [resolvedUrl]);
 
   async function onRun() {
+    // FIX #34 (v2.18): ottieni un ID univoco per questa invocazione.
+    // Tutti gli setState successivi avvengono solo se siamo ancora la run corrente.
+    const myRunId = ++runIdRef.current;
+    const isCurrent = () => runIdRef.current === myRunId;
+
+    // FIX #33 (v2.18): setLoading(true) IMMEDIATAMENTE, prima di qualsiasi await.
+    // Prima era posizionato dopo expandShortMaps() (5-10s con ScrapingBee),
+    // lasciando il bottone abilitato e causando race conditions.
+    setLoading(true);
     setError("");
     setResult(null);
     setResolvedUrl("");
@@ -174,8 +211,11 @@ export default function App() {
       // Espansione link corto, se necessario
       if (isShortGmaps(urlToUse)) {
         const exp = await expandShortMaps(urlToUse);
+        if (!isCurrent()) return; // FIX #34: un'altra run ha preso il timone
         if (exp) urlToUse = unwrapConsentUrl(exp); // anche l'espanso può finire su consent
         else {
+          // FIX #35: setResult(null) difensivo prima di setError
+          setResult(null);
           setError(
             "Non sono riuscito a espandere questo link corto di Google Maps. " +
             "Apri il link in un browser desktop (Chrome/Safari), attendi che si apra Google Maps, " +
@@ -184,6 +224,7 @@ export default function App() {
           return;
         }
       }
+      if (!isCurrent()) return;
       setResolvedUrl(urlToUse);
 
       // Determina il parser appropriato in base all'host
@@ -211,11 +252,11 @@ export default function App() {
 
       if (parsedNow.kind === "place") {
         // === Caso POSIZIONE SINGOLA: niente routing, 1 solo punto ===
-        // FIX #2: setLoading(true) era mancante in questo ramo
-        setLoading(true);
         const place = await ensureCoords(parsedNow.place);
+        if (!isCurrent()) return; // FIX #34
         // Finestra meteo stretta (±12h)
         const meteo = await fetchWeatherForWindow(place.lat, place.lon, departure, departure);
+        if (!isCurrent()) return;
         const weather = pickHourlyForDate(meteo, departure);
 
         // Reverse per nome/prov se non già presenti
@@ -227,6 +268,7 @@ export default function App() {
           } catch {}
         }
 
+        if (!isCurrent()) return;
         setResult({
           summary: { distance: 0, duration: 0, legs: 0, singlePlace: true },
           schedule: [{ type: "point", place, at: departure, legInfo: null, km: 0, weather }],
@@ -236,10 +278,6 @@ export default function App() {
       }
 
       // === Caso INDICAZIONI ===
-      // FIX #7 (v2.11): setLoading(true) PRIMA del geocoding,
-      // così il bottone mostra "Calcolo…" anche durante ensureCoords()
-      setLoading(true);
-
       // FIX #15 (v2.12): geocoding "tollerante al fallimento parziale".
       // Per ciascuna tappa proviamo a risolvere le coordinate; se la tappa
       // intermedia non si trova, la saltiamo e mostriamo un avviso.
@@ -254,6 +292,7 @@ export default function App() {
           }
         })
       );
+      if (!isCurrent()) return; // FIX #34
 
       const firstResult = geocodeResults[0];
       const lastResult = geocodeResults[geocodeResults.length - 1];
@@ -280,16 +319,49 @@ export default function App() {
             : `Tappe intermedie saltate: ${skipped.map((s) => `"${s}"`).join(", ")} (coordinate non trovate). La rotta è stata calcolata senza queste tappe.`)
         : null;
 
+      // FIX #38 (v2.18): sanity check sul geocoding.
+      // Se 3+ tappe sono entro 500m l'una dall'altra, è quasi certo un collasso
+      // del geocoder su coordinate generiche. Errore esplicito.
+      if (places.length >= 3) {
+        const tooClose = countCloseClusters(places, 0.5); // 500m
+        if (tooClose >= 3) {
+          throw new Error(
+            `Geocoding sospetto: ${tooClose} tappe risultano molto vicine tra loro (entro 500m). ` +
+            `Probabilmente il link contiene nomi che non sono stati riconosciuti correttamente. ` +
+            `Prova a usare un link diretto da Google Maps con coordinate, oppure verifica le tappe.`
+          );
+        }
+      }
+
       // Routing OSRM (alias: "motorcycle" => driving)
       const osrmProfile = travelMode === "motorcycle" ? "driving" : travelMode;
       const coordsPath = places.map((p) => `${p.lon},${p.lat}`).join(";");
       const osrmUrl = `https://router.project-osrm.org/route/v1/${osrmProfile}/${coordsPath}?overview=full&geometries=geojson&steps=false&annotations=distance,duration`;
 
       const routeResp = await fetch(osrmUrl);
+      if (!isCurrent()) return;
       if (!routeResp.ok) throw new Error("Errore routing OSRM");
       const routeJson = await routeResp.json();
       const route = routeJson.routes?.[0];
       if (!route) throw new Error("Percorso non trovato");
+
+      // FIX #37 (v2.18): validazione OSRM.
+      // Se la rotta totale è < 100m oppure qualche leg ha distance 0,
+      // OSRM ha praticamente non calcolato nulla (coordinate coincidenti
+      // o non raggiungibili). Errore esplicito invece di timeline finta.
+      if (route.distance < 100) {
+        throw new Error(
+          `OSRM ha calcolato una rotta degenere (${Math.round(route.distance)}m totali). ` +
+          `Le coordinate delle tappe sono troppo vicine o coincidenti. ` +
+          `Verifica che il link contenga tappe distinte.`
+        );
+      }
+      if (route.legs?.some((leg) => leg.distance === 0)) {
+        throw new Error(
+          `OSRM ha trovato una o più tratte di lunghezza zero. ` +
+          `Probabilmente due tappe consecutive hanno le stesse coordinate.`
+        );
+      }
 
       // Timeline (start + fine di ogni leg)
       let t = new Date(departure);
@@ -338,6 +410,7 @@ export default function App() {
           }
         }
       }
+      if (!isCurrent()) return;
 
       // Meteo finestra comune
       const startAt = new Date(waypointsSchedule[0].at);
@@ -349,6 +422,7 @@ export default function App() {
         const meteo = await fetchWeatherForWindow(wp.place.lat, wp.place.lon, startAt, endAt);
         weatherByKey.set(key, meteo);
       }
+      if (!isCurrent()) return;
 
       const enriched = allPoints
         .map((wp) => {
@@ -358,6 +432,7 @@ export default function App() {
         })
         .sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime());
 
+      if (!isCurrent()) return;
       setResult({
         summary: { distance: route.distance, duration: route.duration, legs: route.legs.length },
         schedule: enriched,
@@ -368,9 +443,13 @@ export default function App() {
         routeGeometry: route.geometry?.coordinates || null,
       });
     } catch (e) {
-      setError((e && e.message) || String(e));
+      // FIX #35: setResult(null) difensivo anche nel catch generale
+      if (isCurrent()) {
+        setResult(null);
+        setError((e && e.message) || String(e));
+      }
     } finally {
-      setLoading(false);
+      if (isCurrent()) setLoading(false);
     }
   }
 
@@ -949,23 +1028,28 @@ async function _tryNominatim(q) {
 }
 
 // Provider 3: Photon (Komoot) — tollerante ai typo, ottimo come fallback
+// FIX #36 (v2.18): HARD filter su countrycode === "IT". Prima Photon
+// accettava il primo risultato globale se nessun IT match, causando
+// "collassi" di tappe diverse alle stesse coordinate generiche.
+// Ora ritorna null se nessun risultato italiano: meglio un errore
+// esplicito che un risultato sbagliato silenzioso.
 async function _tryPhoton(q) {
   try {
     const u = new URL("https://photon.komoot.io/api/");
     u.searchParams.set("q", q);
     u.searchParams.set("lang", "it");
-    u.searchParams.set("limit", "3");
+    u.searchParams.set("limit", "5");
     u.searchParams.set("lat", "42.5");
     u.searchParams.set("lon", "12.5");
     const r = await fetch(u.toString());
     if (!r.ok) return null;
     const j = await r.json();
     const features = j?.features || [];
+    // HARD filter: solo risultati con countrycode "IT" sono accettati.
     const itHit = features.find((f) => f?.properties?.countrycode === "IT");
-    const hit = itHit || features[0];
-    if (!hit) return null;
-    const [lon, lat] = hit.geometry.coordinates;
-    const props = hit.properties || {};
+    if (!itHit) return null;
+    const [lon, lat] = itHit.geometry.coordinates;
+    const props = itHit.properties || {};
     const resolvedName = props.name || props.city || props.street || q;
     return {
       name: resolvedName,
@@ -1125,6 +1209,26 @@ function toISODate(d) { const y = d.getFullYear(); const m = String(d.getMonth()
 
 // ——— Campionamento lungo percorso ———
 function haversineMeters(lat1, lon1, lat2, lon2) { const R = 6371000; const toRad = (x) => (x * Math.PI) / 180; const dLat = toRad(lat2 - lat1); const dLon = toRad(lon2 - lon1); const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2; const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)); return R * c; }
+
+// FIX #38 (v2.18): conta quanti `places` hanno almeno un altro `place`
+// entro `kmThreshold` km. Usato come sanity check: se troppe tappe sono
+// "appiccicate", il geocoder probabilmente ha collassato.
+function countCloseClusters(places, kmThreshold) {
+  if (!Array.isArray(places) || places.length < 2) return 0;
+  let count = 0;
+  for (let i = 0; i < places.length; i++) {
+    const pi = places[i];
+    if (!Number.isFinite(pi?.lat) || !Number.isFinite(pi?.lon)) continue;
+    for (let j = 0; j < places.length; j++) {
+      if (i === j) continue;
+      const pj = places[j];
+      if (!Number.isFinite(pj?.lat) || !Number.isFinite(pj?.lon)) continue;
+      const d = haversineMeters(pi.lat, pi.lon, pj.lat, pj.lon) / 1000;
+      if (d < kmThreshold) { count++; break; }
+    }
+  }
+  return count;
+}
 function cumulativeDistances(coords) { const cum = [0]; for (let i = 1; i < coords.length; i++) { const [lon1, lat1] = coords[i - 1]; const [lon2, lat2] = coords[i]; cum.push(cum[cum.length - 1] + haversineMeters(lat1, lon1, lat2, lon2)); } return cum; }
 function interpolatePoint(p1, p2, t) { const [lon1, lat1] = p1; const [lon2, lat2] = p2; return [lon1 + (lon2 - lon1) * t, lat1 + (lat2 - lat1) * t]; }
 function pointAtDistance(coords, cum, target) { let i = 1; while (i < cum.length && cum[i] < target) i++; if (i >= cum.length) return coords[coords.length - 1]; const prev = i - 1; const segLen = cum[i] - cum[prev]; const tt = segLen > 0 ? (target - cum[prev]) / segLen : 0; return interpolatePoint(coords[prev], coords[i], Math.max(0, Math.min(1, tt))); }
